@@ -20,7 +20,7 @@ def headless_resnet():
     resnet = torchvision.models.resnet50(weights=torchvision.models.ResNet50_Weights.DEFAULT)
     return nn.Sequential(*list(resnet.children())[:-1])
 
-class double_resnet(nn.Module):
+class DoubleResnet50(nn.Module):
     def __init__(self):
         super().__init__()
         
@@ -66,7 +66,7 @@ class TwoChannelCustomDataset(Dataset):
 
     def __getitem__(self, idx):    
         img_name = self.bbox_label.iloc[idx, 0]
-        obj_name = img_name[:-3] + "png"
+        obj_name = img_name[:-3] + "jpg"
         img_path = os.path.join(self.img_dir, img_name)
         obj_path = os.path.join(self.obj_dir, obj_name)       
         image = decode_image(img_path).type(torch.float32)
@@ -79,7 +79,7 @@ class TwoChannelCustomDataset(Dataset):
             label = self.target_transform(label)
         example = torch.cat((image,obj),0)
         
-        return example.to(gpu), label.to(gpu)
+        return example.to(gpu), label.to(gpu), img_name
 
     def get_imgname(self, idx):
         return self.bbox_label.iloc[idx, 0]
@@ -87,9 +87,79 @@ class TwoChannelCustomDataset(Dataset):
 def get_imgname(revoc, img):
     for idx in range(len(revoc)):
         ds_img, _ = revoc[idx]
-        if torch.equal(img, ds_img):
+        if id(img) == id(ds_img):
             return revoc.get_imgname(idx)
+        """
+        if torch.equal(img, ds_img):
+            return revoc.get_imgname(idx)"""
 
 resnet_preprocess = torchvision.transforms.Compose([
     torchvision.transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
 ])
+
+def train_loop(dataloader, model, loss_fn, optimizer, result_dict, t=None):
+    batch_num = len(dataloader)
+    model.train()
+    total_loss = 0
+    for batch, (X, y, _) in enumerate(dataloader):
+        # Compute prediction and loss
+        pred = model(X)
+        loss = loss_fn(pred, y)
+        total_loss += loss.item()
+
+        # Backpropagation
+        loss.backward()
+        optimizer.step()
+        optimizer.zero_grad()
+    print(f"epoch: {t + 1}, avg train loss: {total_loss/batch_num}")
+    if t is not None:
+        result_dict[t] = {"train": total_loss/batch_num} # create dict because we run train BEFORE test in each epoch
+
+def test_loop(dataloader, model, loss_fn,result_dict, t=None):
+    # Set the model to evaluation mode - important for batch normalization and dropout layers
+    # Unnecessary in this situation but added for best practices
+    model.eval()
+    batch_num = len(dataloader)
+    test_loss, correct = 0, 0
+
+    # Evaluating the model with torch.no_grad() ensures that no gradients are computed during test mode
+    # also serves to reduce unnecessary gradient computations and memory usage for tensors with requires_grad=True
+    with torch.no_grad():
+        for X, y,_ in dataloader:
+            pred = model(X)
+            test_loss += loss_fn(pred, y).item()    
+    print(f"epoch: {t + 1}, avg test loss: {test_loss/batch_num}")
+    if t is not None:
+        result_dict[t]["test"] = test_loss # edit dict because we run test AFTER train in each epoch
+
+def save_eval(dataset, model, loss_fn, full_dataset, out_dir="output/"):
+    # Do prediction one by one so we can save result
+    model.eval()
+    total_loss = 0
+
+    with open(os.path.join(out_dir, "output.csv"), "a") as out_file:
+    
+        # Evaluating the model with torch.no_grad() ensures that no gradients are computed during test mode
+        # also serves to reduce unnecessary gradient computations and memory usage for tensors with requires_grad=True
+        with torch.no_grad():
+            for X, y, n in dataset:
+                pred = model(X)
+                out_name = n
+                out_label = []
+                out_pred = []
+                for x in X:
+                    pass
+                    #name = n
+                    #name = get_imgname(full_dataset, x)
+                    # name = "placeholder"
+                    #out_name.append(name)
+                for label in y:
+                    xmin, ymin, xmax, ymax = [str(int(x)) for x in label.tolist()]
+                    out_label.append(",".join([xmin, ymin, xmax, ymax]))
+                for label in pred:
+                    pred_xmin, pred_ymin, pred_xmax, pred_ymax = [str(int(x)) for x in label.tolist()]
+                    out_pred.append(",".join([pred_xmin, pred_ymin, pred_xmax, pred_ymax]))
+                for i in range(len(out_name)):
+                    out_file.write(out_name[i] + "," + out_label[i] + "," + out_pred[i] + "\n")
+        
+        

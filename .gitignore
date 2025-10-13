@@ -1,3 +1,5 @@
 /dataset
 /saved_model
 .ipynb_checkpoints
+train.sh
+/utils/__pycache__

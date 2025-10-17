@@ -110,7 +110,7 @@ def main(dataloader, img_dir, label_dir, model, loss,
     print("Model weight saved to weight.pt")
 
     print("Saving result on test set. This will take a while...")
-    save_eval(test_dataloader, model, loss, dataset)
+    save_eval(test_dataloader, model, loss)
     print("ALL DONE!")
 
 
@@ -120,6 +120,6 @@ def main(dataloader, img_dir, label_dir, model, loss,
 
 if __name__ == "__main__":
     print(f"cuda is available: {torch.cuda.is_available()}")
-    print(torch.cuda.current_device())
+    print(f"current device: {torch.cuda.current_device()}")
     print(f"using {gpu}")
     fire.Fire(main)

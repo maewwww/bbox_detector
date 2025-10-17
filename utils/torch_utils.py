@@ -10,7 +10,7 @@ import torch.nn as nn
 from torch.utils.data import Dataset
 from torchvision import datasets
 from torch.utils.data import DataLoader
-from torchvision.transforms import ToTensor, Pad
+from torchvision.transforms import ToTensor, Pad, Resize
 from torchvision.io import decode_image
 from torchinfo import summary as model_summary
 
@@ -98,22 +98,26 @@ class OPADataset(Dataset):
     def __init__(self, label_dir, img_dir, obj_dir, transform=None, target_transform=None):
         with open(label_dir, "r") as f:
             self.bbox_label = f.readlines()
-        self.pad_label = 55
+        self.pad_label = 55 # length of label (see how label is padded in __getitem__)
+        self.img_pad_size = 640
+        self.img_size = [512, 512] # target size of image
         self.img_dir = img_dir
         self.obj_dir = obj_dir
         self.transform = transform
         self.target_transform = target_transform
+        self.resize_ratio = self.img_size[0] / self.img_pad_size
 
     def __len__(self):
         return len(self.bbox_label)
 
     def __getitem__(self, idx):
         label_line = self.bbox_label[idx].split(",")
-
-        img_name = label_line[1] + ".jpg"
-        obj_name = label_line[0] + ".jpg"
+        img_id = label_line[1]
+        obj_id = label_line[0]
+        img_name = img_id + ".jpg"
+        obj_name = obj_id + ".jpg"
         cat = label_line[2]
-        name = img_name + "c" + obj_name
+        name = obj_id + "c" + img_id
 
         img_path = os.path.join(self.img_dir, cat, img_name)
         obj_path = os.path.join(self.obj_dir, cat, obj_name)       
@@ -123,18 +127,26 @@ class OPADataset(Dataset):
         label = label_line[3:]
         label = [float(x) for x in label]
         label = n_slice(label, 4)
+        for sublabel in label:
+            for i, element in enumerate(sublabel):
+                sublabel[i] = element * self.resize_ratio
         while len(label) < self.pad_label:
             label.append([float('inf')]*4)
         label = torch.tensor(label).type(torch.float32)
-        # Dimension of label is (n, 4) where we pad label to be n = self.pad_label bboxes.
+        # Dimension of label is (n, 4) where we pad label to conain n = self.pad_label bboxes.
         # Example: [[x1, y1, w1, h1],
         #           [x2, y2, w2, h2],
         #           ...
         #           [xn, yn, wn, hn]]
 
+        resize = Resize(self.img_size)
         if self.transform:
-            image = pad_to_n(self.transform(image), 640)
-            obj = pad_to_n(self.transform(obj), 640)
+            image = resize(
+                pad_to_n(self.transform(image), self.img_pad_size)
+            )
+            obj = resize(
+                pad_to_n(self.transform(obj), self.img_pad_size)
+            )
         if self.target_transform:
             label = self.target_transform(label)
         example = torch.cat((image,obj),0)
@@ -192,7 +204,7 @@ def train_loop(dataloader, model, loss_fn, optimizer, result_dict, t=None):
         # Compute prediction and loss
         pred = model(X)
         loss = loss_fn(pred, y)
-        # total_loss += loss.item() FIXME
+        total_loss += loss.item()
 
         # Backpropagation
         #loss.requires_grad = True
@@ -217,12 +229,12 @@ def test_loop(dataloader, model, loss_fn,result_dict, t=None):
     with torch.no_grad():
         for X, y,_ in dataloader:
             pred = model(X)
-            #test_loss += loss_fn(pred, y).item()    
+            test_loss += loss_fn(pred, y).item()    
     print(f"epoch: {t + 1}, avg test loss: {test_loss/batch_num}")
     if t is not None:
         result_dict[t]["test"] = test_loss # edit dict because we run test AFTER train in each epoch
 
-def save_eval(dataset, model, loss_fn, full_dataset, out_dir="output/"):
+def save_eval(dataset, model, loss_fn, full_dataset=None, out_dir="output/"):
     # Do prediction one by one so we can save result
     model.eval()
     total_loss = 0
@@ -237,6 +249,12 @@ def save_eval(dataset, model, loss_fn, full_dataset, out_dir="output/"):
                 out_name = n
                 out_label = []
                 out_pred = []
+                print("debugging save eval")
+                print(f"X: {X}")
+                print(f"shape X: ")
+                print(f"y: {y}")
+                print(f"n: {n}")
+                """
                 for x in X:
                     pass
                     #name = n
@@ -244,12 +262,13 @@ def save_eval(dataset, model, loss_fn, full_dataset, out_dir="output/"):
                     # name = "placeholder"
                     #out_name.append(name)
                 for label in y:
+                    label = [x for x in label if x != [float("inf")]*4]
                     xmin, ymin, xmax, ymax = [str(int(x)) for x in label.tolist()]
-                    out_label.append(",".join([xmin, ymin, xmax, ymax]))
+                    out_label.append(",".join([xmin, ymin, xmax, ymax]))"""
                 for label in pred:
                     pred_xmin, pred_ymin, pred_xmax, pred_ymax = [str(int(x)) for x in label.tolist()]
                     out_pred.append(",".join([pred_xmin, pred_ymin, pred_xmax, pred_ymax]))
                 for i in range(len(out_name)):
-                    out_file.write(out_name[i] + "," + out_label[i] + "," + out_pred[i] + "\n")
+                    out_file.write(out_name[i] + "," + out_pred[i] + "\n")
         
         

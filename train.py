@@ -10,6 +10,7 @@ def get_dataset(dataloader, img_dir, label_dir, obj_dir, model):
     match model:
         case "double_resnet50":
             transform = resnet_preprocess
+    
     match dataloader:
         case "one_channel":
             raise NotImplemented
@@ -17,6 +18,10 @@ def get_dataset(dataloader, img_dir, label_dir, obj_dir, model):
             return TwoChannelCustomDataset(label_dir=label_dir, img_dir=img_dir, obj_dir=obj_dir,
                                            transform=transform,
                                            target_transform=None,)
+        case "OPA":
+            return OPADataset(label_dir=label_dir, img_dir=img_dir, obj_dir=obj_dir,
+                                           transform=transform,
+                                           target_transform=None)
 
 def get_model(model):
     match model:
@@ -27,6 +32,8 @@ def get_loss(loss):
     match loss:
         case "mse":
             return torch.nn.MSELoss(reduction='sum')
+        case "var_mse_min":
+            return var_mse_min
         
 def get_optim(optim, model, lr):
     match optim:
@@ -35,11 +42,11 @@ def get_optim(optim, model, lr):
 
 
 def main(dataloader, img_dir, label_dir, model, loss,
-         lr, optim, epoch,
+         lr, optim, epoch, test_label_dir=None,
          batch_size="16", obj_dir=None):
-    dataloaders = ["one_channel", "two_channel"]
+    dataloaders = ["one_channel", "two_channel", "OPA"]
     models = ["double_resnet50"]
-    losses = ["mse"]
+    losses = ["mse", "var_mse_min"]
     optims = ["adam"]
 
     assert dataloader in dataloaders, "Unknown Dataloader"
@@ -71,15 +78,21 @@ def main(dataloader, img_dir, label_dir, model, loss,
 
     lr, batch_size, epoch = float(lr), int(batch_size), int(epoch)
 
-    dataset = get_dataset(dataloader, img_dir, label_dir, obj_dir, model)
+    if test_label_dir is not None:
+        train_dataset = get_dataset(dataloader, img_dir, label_dir, obj_dir, model)
+        test_dataset = get_dataset(dataloader, img_dir, test_label_dir, obj_dir, model)
+    else:
+        dataset = get_dataset(dataloader, img_dir, label_dir, obj_dir, model)
+        train_dataset, test_dataset = torch.utils.data.random_split(dataset, [0.8, 0.2])
+
     model = get_model(model)
     model.to(gpu)
     loss = get_loss(loss)
     optim = get_optim(optim,model,lr)
 
-    train_dataset, test_dataset = torch.utils.data.random_split(dataset, [0.8, 0.2])
     train_dataloader = DataLoader(train_dataset, batch_size=batch_size)
     test_dataloader = DataLoader(test_dataset, batch_size=batch_size)
+
     result_dict = {}
 
     for t in range(epoch):

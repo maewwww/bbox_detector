@@ -16,6 +16,11 @@ from torchinfo import summary as model_summary
 
 gpu = torch.device('cuda:0')
 
+def n_slice(lists, n):
+    if lists == []:
+        return []
+    return [lists[:n]] + n_slice(lists[n:], n)
+
 def headless_resnet():
     resnet = torchvision.models.resnet50(weights=torchvision.models.ResNet50_Weights.DEFAULT)
     return nn.Sequential(*list(resnet.children())[:-1])
@@ -45,9 +50,9 @@ class DoubleResnet50(nn.Module):
 
         return o
     
-def pad_to_500(img):
-    down = 500 - img.shape[1]
-    right = 500 - img.shape[2]
+def pad_to_n(img, n=500):
+    down = n - img.shape[1]
+    right = n - img.shape[2]
     pad = Pad((0,0,right,down))
     return pad(img)
         
@@ -73,13 +78,68 @@ class TwoChannelCustomDataset(Dataset):
         obj = decode_image(obj_path).type(torch.float32)
         label = torch.tensor([self.bbox_label.iloc[idx, i] for i in range(1,5)]).type(torch.float32)
         if self.transform:
-            image = pad_to_500(self.transform(image))
+            image = pad_to_n(self.transform(image), 500)
             obj = self.transform(obj)
         if self.target_transform:
             label = self.target_transform(label)
         example = torch.cat((image,obj),0)
         
         return example.to(gpu), label.to(gpu), img_name
+
+    def get_imgname(self, idx):
+        return self.bbox_label.iloc[idx, 0]
+
+"""x = [[1, 2, 3, 4], [5, 6, 7, 8], [9, 10, 11, 12]]
+x = torch.tensor(x)
+for i in x: print(i)"""
+
+# Torch dataset class for loading OPA with variable label length
+class OPADataset(Dataset):
+    def __init__(self, label_dir, img_dir, obj_dir, transform=None, target_transform=None):
+        with open(label_dir, "r") as f:
+            self.bbox_label = f.readlines()
+        self.pad_label = 55
+        self.img_dir = img_dir
+        self.obj_dir = obj_dir
+        self.transform = transform
+        self.target_transform = target_transform
+
+    def __len__(self):
+        return len(self.bbox_label)
+
+    def __getitem__(self, idx):
+        label_line = self.bbox_label[idx].split(",")
+
+        img_name = label_line[1] + ".jpg"
+        obj_name = label_line[0] + ".jpg"
+        cat = label_line[2]
+        name = img_name + "c" + obj_name
+
+        img_path = os.path.join(self.img_dir, cat, img_name)
+        obj_path = os.path.join(self.obj_dir, cat, obj_name)       
+        image = decode_image(img_path).type(torch.float32)
+        obj = decode_image(obj_path).type(torch.float32)
+
+        label = label_line[3:]
+        label = [float(x) for x in label]
+        label = n_slice(label, 4)
+        while len(label) < self.pad_label:
+            label.append([float('inf')]*4)
+        label = torch.tensor(label).type(torch.float32)
+        # Dimension of label is (n, 4) where we pad label to be n = self.pad_label bboxes.
+        # Example: [[x1, y1, w1, h1],
+        #           [x2, y2, w2, h2],
+        #           ...
+        #           [xn, yn, wn, hn]]
+
+        if self.transform:
+            image = pad_to_n(self.transform(image), 640)
+            obj = pad_to_n(self.transform(obj), 640)
+        if self.target_transform:
+            label = self.target_transform(label)
+        example = torch.cat((image,obj),0)
+        
+        return example.to(gpu), label.to(gpu), name
 
     def get_imgname(self, idx):
         return self.bbox_label.iloc[idx, 0]
@@ -97,6 +157,33 @@ resnet_preprocess = torchvision.transforms.Compose([
     torchvision.transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
 ])
 
+def var_mse_min(pred, label):
+    """perform mse for each sublabel in label and return the minimum one"""
+
+    mse = torch.nn.MSELoss(reduction='sum')
+    result = []
+    
+    for i in range(len(pred)):
+
+        min_loss_value = float("inf")
+        min_loss = None
+
+        subpred = pred[i]
+        sublabel = label[i]
+
+        for candidate in sublabel:
+            
+            #print(f"Calculating loss between {subpred} and {candidate}")
+            loss = mse(subpred, candidate)
+
+            if loss.item() < min_loss_value:
+                min_loss_value = loss.item()
+                min_loss = loss
+
+        #print(min_loss)
+        result.append(min_loss)
+    return sum(result)
+
 def train_loop(dataloader, model, loss_fn, optimizer, result_dict, t=None):
     batch_num = len(dataloader)
     model.train()
@@ -105,10 +192,17 @@ def train_loop(dataloader, model, loss_fn, optimizer, result_dict, t=None):
         # Compute prediction and loss
         pred = model(X)
         loss = loss_fn(pred, y)
-        total_loss += loss.item()
+        # total_loss += loss.item() FIXME
 
         # Backpropagation
+        #loss.requires_grad = True
+        #loss.to(gpu)
+        #print(loss)
+        #print()
         loss.backward()
+        """
+        for each_loss in loss:
+            each_loss.backward(retain_graph=True)"""
         optimizer.step()
         optimizer.zero_grad()
     print(f"epoch: {t + 1}, avg train loss: {total_loss/batch_num}")
@@ -116,18 +210,14 @@ def train_loop(dataloader, model, loss_fn, optimizer, result_dict, t=None):
         result_dict[t] = {"train": total_loss/batch_num} # create dict because we run train BEFORE test in each epoch
 
 def test_loop(dataloader, model, loss_fn,result_dict, t=None):
-    # Set the model to evaluation mode - important for batch normalization and dropout layers
-    # Unnecessary in this situation but added for best practices
     model.eval()
     batch_num = len(dataloader)
     test_loss, correct = 0, 0
 
-    # Evaluating the model with torch.no_grad() ensures that no gradients are computed during test mode
-    # also serves to reduce unnecessary gradient computations and memory usage for tensors with requires_grad=True
     with torch.no_grad():
         for X, y,_ in dataloader:
             pred = model(X)
-            test_loss += loss_fn(pred, y).item()    
+            #test_loss += loss_fn(pred, y).item()    
     print(f"epoch: {t + 1}, avg test loss: {test_loss/batch_num}")
     if t is not None:
         result_dict[t]["test"] = test_loss # edit dict because we run test AFTER train in each epoch

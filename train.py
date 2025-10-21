@@ -6,10 +6,13 @@ import json
 
 gpu = torch.device('cuda:0')
 
-def get_dataset(dataloader, img_dir, label_dir, obj_dir, model):
+def get_dataset(dataloader, img_dir, label_dir, obj_dir, model, mask_dir):
     match model:
         case "double_resnet50":
             transform = resnet_preprocess
+        case "lraspp":
+            transform = LRASPP_preprocess
+            target_transform = LRASPP_target_preprocess
     
     match dataloader:
         case "one_channel":
@@ -22,11 +25,16 @@ def get_dataset(dataloader, img_dir, label_dir, obj_dir, model):
             return OPADataset(label_dir=label_dir, img_dir=img_dir, obj_dir=obj_dir,
                                            transform=transform,
                                            target_transform=None)
+        case "OPA_Dist":
+            return OPADistDataset(label_dir=label_dir, img_dir=img_dir, obj_dir=obj_dir,
+                                  mask_dir=mask_dir, transform=transform, target_transform=target_transform)
 
 def get_model(model):
     match model:
         case "double_resnet50":
             return DoubleResnet50()
+        case "lraspp":
+            return OneOutLRASPP()
         
 def get_loss(loss):
     match loss:
@@ -34,6 +42,8 @@ def get_loss(loss):
             return torch.nn.MSELoss(reduction='sum')
         case "var_mse_min":
             return var_mse_min
+        case "kldiv":
+            return kldiv
         
 def get_optim(optim, model, lr):
     match optim:
@@ -41,12 +51,12 @@ def get_optim(optim, model, lr):
             return torch.optim.Adam(model.parameters(), lr=lr)
 
 
-def main(dataloader, img_dir, label_dir, model, loss,
+def main(dataloader, img_dir, label_dir, mask_dir, model, loss,
          lr, optim, epoch, test_label_dir=None,
          batch_size="16", obj_dir=None):
-    dataloaders = ["one_channel", "two_channel", "OPA"]
-    models = ["double_resnet50"]
-    losses = ["mse", "var_mse_min"]
+    dataloaders = ["one_channel", "two_channel", "OPA", "OPA_Dist"]
+    models = ["double_resnet50", "lraspp"]
+    losses = ["mse", "var_mse_min", "kldiv"]
     optims = ["adam"]
 
     assert dataloader in dataloaders, "Unknown Dataloader"
@@ -79,8 +89,8 @@ def main(dataloader, img_dir, label_dir, model, loss,
     lr, batch_size, epoch = float(lr), int(batch_size), int(epoch)
 
     if test_label_dir is not None:
-        train_dataset = get_dataset(dataloader, img_dir, label_dir, obj_dir, model)
-        test_dataset = get_dataset(dataloader, img_dir, test_label_dir, obj_dir, model)
+        train_dataset = get_dataset(dataloader, img_dir, label_dir, obj_dir, model, mask_dir)
+        test_dataset = get_dataset(dataloader, img_dir, test_label_dir, obj_dir, model, mask_dir)
     else:
         dataset = get_dataset(dataloader, img_dir, label_dir, obj_dir, model)
         train_dataset, test_dataset = torch.utils.data.random_split(dataset, [0.8, 0.2])
@@ -100,7 +110,17 @@ def main(dataloader, img_dir, label_dir, model, loss,
         train_loop(train_dataloader, model, loss, optim, result_dict, t)
         test_loop(test_dataloader, model, loss, result_dict, t)
         print("-------------------------------\n")
+
+        # save intermediate model every 10 epochs
+        if t != 1 and t % 10 == 1:
+            i_modelname = str(t + 1) + "weight.pt"
+            torch.save(model.state_dict(), i_modelname)
+            print("Model weight saved to ", i_modelname)
+
     print(("*"*100)+"\nDone!")
+
+    if not os.path.exists("output/"):
+        os.makedirs("output/")
 
     with open("output/trainingresult.json", "w") as f:
         json.dump(result_dict, f)
@@ -110,7 +130,8 @@ def main(dataloader, img_dir, label_dir, model, loss,
     print("Model weight saved to weight.pt")
 
     print("Saving result on test set. This will take a while...")
-    save_eval(test_dataloader, model, loss)
+    #save_eval(test_dataloader, model, loss)
+    save_dist_eval(test_dataloader,model,kldiv)
     print("ALL DONE!")
 
 

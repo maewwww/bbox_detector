@@ -7,12 +7,16 @@ import matplotlib.pyplot as plt
 
 import torchvision
 import torch.nn as nn
+from torch import flatten
+from torch.nn.functional import kl_div, log_softmax
 from torch.utils.data import Dataset
 from torchvision import datasets
 from torch.utils.data import DataLoader
 from torchvision.transforms import ToTensor, Pad, Resize
 from torchvision.io import decode_image
 from torchinfo import summary as model_summary
+from torchvision.models.segmentation import lraspp_mobilenet_v3_large
+from torchvision.models.segmentation.lraspp import LRASPPHead
 
 gpu = torch.device('cuda:0')
 
@@ -20,6 +24,54 @@ def n_slice(lists, n):
     if lists == []:
         return []
     return [lists[:n]] + n_slice(lists[n:], n)
+
+def OneOutLRASPP():
+    model = lraspp_mobilenet_v3_large(num_classes=1)
+
+    old_in = model.backbone["0"][0]
+    old_batch_norm1 = model.backbone["0"][1]
+    old_conv2 = model.backbone["1"].block[0][0]
+    old_bn2 = model.backbone["1"].block[0][1]
+    old_conv3 = model.backbone["1"].block[1][0]
+    old_bn3 = model.backbone["1"].block[1][1]
+    old_conv4 = model.backbone["2"].block[0][0]
+
+    new_in = nn.Conv2d(in_channels=6, out_channels=32, kernel_size=(3, 3), stride=(2, 2), padding=(1, 1), bias=False)
+    batch_norm1 = nn.BatchNorm2d(32, eps=0.001, momentum=0.01, affine=True, track_running_stats=True)
+    conv2 = nn.Conv2d(32, 32, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), groups=32, bias=False)
+    bn2 = nn.BatchNorm2d(32, eps=0.001, momentum=0.01, affine=True, track_running_stats=True)
+    conv3 = nn.Conv2d(32, 32, kernel_size=(1, 1), stride=(1, 1), bias=False)
+    bn3 = nn.BatchNorm2d(32, eps=0.001, momentum=0.01, affine=True, track_running_stats=True)
+    conv4 = nn.Conv2d(32, 64, kernel_size=(1, 1), stride=(1, 1), bias=False)
+
+    with torch.no_grad():
+        new_in.weight[16:, 3:, :, :] = old_in.weight
+        new_in.weight[:16, :3, :, :] = old_in.weight
+        batch_norm1.weight = nn.parameter.Parameter( torch.cat((old_batch_norm1.weight, old_batch_norm1.weight)) )
+        conv2.weight[16: , :, :, :] = old_conv2.weight
+        conv2.weight[:16 , :, :, :] = old_conv2.weight
+        bn2.weight = nn.parameter.Parameter( torch.cat((old_bn2.weight, old_bn2.weight)) )
+        conv3.weight[16: , 16:, :, :] = old_conv3.weight
+        conv3.weight[:16 , :16, :, :] = old_conv3.weight
+        bn3.weight = nn.parameter.Parameter( torch.cat((old_bn3.weight, old_bn3.weight)) )
+        conv4.weight[: , 16:, :, :] = old_conv4.weight
+        conv4.weight[: , :16, :, :] = old_conv4.weight
+    
+    model.backbone["0"][0] = new_in
+    model.backbone["0"][1] = batch_norm1
+    model.backbone["1"].block[0][0] = conv2
+    model.backbone["1"].block[0][1] = bn2
+    model.backbone["1"].block[1][0] = conv3
+    model.backbone["1"].block[1][1] = bn3
+    model.backbone["2"].block[0][0] = conv4
+
+    #model.classifier = LRASPPHead(low_channels=128, high_channels=960, num_classes=1, inter_channels=256)
+
+    return model
+
+
+
+
 
 def headless_resnet():
     resnet = torchvision.models.resnet50(weights=torchvision.models.ResNet50_Weights.DEFAULT)
@@ -55,6 +107,24 @@ def pad_to_n(img, n=500):
     right = n - img.shape[2]
     pad = Pad((0,0,right,down))
     return pad(img)
+
+def pad_to_640(img):
+    return pad_to_n(img, 640)
+
+def normalize_mask(t):
+    return torch.div(t, 255)
+
+LRASPP_preprocess = torchvision.transforms.Compose([
+    pad_to_640,
+    Resize([520,520]),
+    torchvision.transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+])
+
+LRASPP_target_preprocess = torchvision.transforms.Compose([
+    pad_to_640,
+    Resize([520,520]),
+    normalize_mask,
+])
         
 # Subset of VOC'2012 with object removed that CONTAIN 2 IMAGES
 # We stack the tensors for the image and obj together
@@ -88,10 +158,6 @@ class TwoChannelCustomDataset(Dataset):
 
     def get_imgname(self, idx):
         return self.bbox_label.iloc[idx, 0]
-
-"""x = [[1, 2, 3, 4], [5, 6, 7, 8], [9, 10, 11, 12]]
-x = torch.tensor(x)
-for i in x: print(i)"""
 
 # Torch dataset class for loading OPA with variable label length
 class OPADataset(Dataset):
@@ -152,9 +218,44 @@ class OPADataset(Dataset):
         example = torch.cat((image,obj),0)
         
         return example.to(gpu), label.to(gpu), name
+    
+class OPADistDataset(Dataset):
+    def __init__(self, label_dir, img_dir, obj_dir, mask_dir, transform=None, target_transform=None):
+        with open(label_dir, "r") as f:
+            self.bbox_label = f.readlines()
+        self.img_dir = img_dir
+        self.obj_dir = obj_dir
+        self.mask_dir = mask_dir
+        self.transform = transform
+        self.target_transform = target_transform
 
-    def get_imgname(self, idx):
-        return self.bbox_label.iloc[idx, 0]
+    def __len__(self):
+        return len(self.bbox_label)
+
+    def __getitem__(self, idx):
+        label_line = self.bbox_label[idx].split(",")        
+        cat = label_line[2]
+        img_id = label_line[1]
+        obj_id = label_line[0]
+        img_name = img_id + ".jpg"
+        obj_name = obj_id + ".jpg"
+        comp_name = obj_id + "c" + img_id
+
+        img_path = os.path.join(self.img_dir, cat, img_name)
+        obj_path = os.path.join(self.obj_dir, cat, obj_name)    
+        mask_path = os.path.join(self.mask_dir, cat, comp_name + ".jpg")
+        image = decode_image(img_path).type(torch.float32)
+        obj = decode_image(obj_path).type(torch.float32)
+        mask = decode_image(mask_path).type(torch.uint8)
+
+        if self.transform:
+            image = self.transform(image)
+            obj = self.transform(image)
+        if self.target_transform:
+            label = self.target_transform(mask)
+        example = torch.cat((image,obj),0)
+        
+        return example.to(gpu), label.to(gpu), comp_name
     
 def get_imgname(revoc, img):
     for idx in range(len(revoc)):
@@ -195,6 +296,10 @@ def var_mse_min(pred, label):
         #print(min_loss)
         result.append(min_loss)
     return sum(result)
+
+to_logspace = lambda x: log_softmax(flatten(x, 2), 2)
+kldiv = lambda x, y: nn.functional.kl_div(to_logspace(x["out"]), to_logspace(y), reduction="batchmean", log_target=True)
+
 
 def train_loop(dataloader, model, loss_fn, optimizer, result_dict, t=None):
     batch_num = len(dataloader)
@@ -249,11 +354,6 @@ def save_eval(dataset, model, loss_fn, full_dataset=None, out_dir="output/"):
                 out_name = n
                 out_label = []
                 out_pred = []
-                print("debugging save eval")
-                print(f"X: {X}")
-                print(f"shape X: ")
-                print(f"y: {y}")
-                print(f"n: {n}")
                 """
                 for x in X:
                     pass
@@ -270,5 +370,17 @@ def save_eval(dataset, model, loss_fn, full_dataset=None, out_dir="output/"):
                     out_pred.append(",".join([pred_xmin, pred_ymin, pred_xmax, pred_ymax]))
                 for i in range(len(out_name)):
                     out_file.write(out_name[i] + "," + out_pred[i] + "\n")
+
+def save_dist_eval(dataset, model, loss_fn, out_dir="output/"):
+    model.eval()
+    total_loss = 0    
+    with torch.no_grad():
+        for X, y, n in dataset:
+            pred = model(X)["out"]
+            for i, x in enumerate(pred):
+                fn = os.path.join(out_dir, n[i] + ".png")
+                x = torch.clamp(x[0], min=0,max=1)
+                img = (x * 255).cpu().numpy().astype('uint8')
+                cv2.imwrite(fn, img)
         
         

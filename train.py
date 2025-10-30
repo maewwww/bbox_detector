@@ -13,6 +13,10 @@ def get_dataset(dataloader, img_dir, label_dir, obj_dir, model, mask_dir):
         case "lraspp":
             transform = LRASPP_preprocess
             target_transform = LRASPP_target_preprocess
+        case "unet":
+            transform = unet_preprocess
+            target_transform = unet_target_preprocess
+
     
     match dataloader:
         case "one_channel":
@@ -35,6 +39,8 @@ def get_model(model):
             return DoubleResnet50()
         case "lraspp":
             return OneOutLRASPP()
+        case "unet":
+            return UNet(n_channels=6, n_classes=1)
         
 def get_loss(loss):
     match loss:
@@ -55,7 +61,7 @@ def main(dataloader, img_dir, label_dir, mask_dir, model, loss,
          lr, optim, epoch, test_label_dir=None,
          batch_size="16", obj_dir=None):
     dataloaders = ["one_channel", "two_channel", "OPA", "OPA_Dist"]
-    models = ["double_resnet50", "lraspp"]
+    models = ["double_resnet50", "lraspp", "unet"]
     losses = ["mse", "var_mse_min", "kldiv"]
     optims = ["adam"]
 
@@ -131,7 +137,7 @@ def main(dataloader, img_dir, label_dir, mask_dir, model, loss,
 
     print("Saving result on test set. This will take a while...")
     #save_eval(test_dataloader, model, loss)
-    save_dist_eval(test_dataloader,model,kldiv)
+    save_dist_eval(test_dataloader,model,kldiv,out_dir="local_output")
     print("ALL DONE!")
 
 
@@ -142,5 +148,4 @@ def main(dataloader, img_dir, label_dir, mask_dir, model, loss,
 if __name__ == "__main__":
     print(f"cuda is available: {torch.cuda.is_available()}")
     print(f"current device: {torch.cuda.current_device()}")
-    print(f"using {gpu}")
     fire.Fire(main)

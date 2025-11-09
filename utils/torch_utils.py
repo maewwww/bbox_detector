@@ -144,13 +144,19 @@ class Down(nn.Module):
 
     def __init__(self, in_channels, out_channels):
         super().__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
         self.maxpool_conv = nn.Sequential(
             nn.MaxPool2d(2),
             DoubleConv(in_channels, out_channels)
         )
 
     def forward(self, x):
-        return self.maxpool_conv(x)
+        print(f"\nDown module with in_c:{self.in_channels} and out_c:{self.out_channels}")
+        print(f"input shape: {x.shape}")
+        o = self.maxpool_conv(x)
+        print(f"output shape: {o.shape}")
+        return o
 
 
 class Up(nn.Module):
@@ -158,6 +164,9 @@ class Up(nn.Module):
 
     def __init__(self, in_channels, out_channels, bilinear=True):
         super().__init__()
+
+        self.in_channels = in_channels
+        self.out_channels = out_channels
 
         # if bilinear, use the normal convolutions to reduce the number of channels
         if bilinear:
@@ -168,17 +177,25 @@ class Up(nn.Module):
             self.conv = DoubleConv(in_channels, out_channels)
 
     def forward(self, x1, x2):
+        print(f"\nUp module, in_c={self.in_channels}, out_c={self.out_channels}")
+        print(f"x1 shape BEFORE up {x1.shape}")
         x1 = self.up(x1)
+        print(f"x1 shape AFTER up {x1.shape}")
+        print(f"x2 shape AFTER up {x2.shape}")
         # input is CHW
         diffY = x2.size()[2] - x1.size()[2]
         diffX = x2.size()[3] - x1.size()[3]
 
         x1 = F.pad(x1, [diffX // 2, diffX - diffX // 2,
                         diffY // 2, diffY - diffY // 2])
+        
+        print(f"x1 PATCHED shape {x1.shape}")
         # if you have padding issues, see
         # https://github.com/HaiyongJiang/U-Net-Pytorch-Unstructured-Buggy/commit/0e854509c2cea854e247a9c615f175f76fbb2e3a
         # https://github.com/xiaopeng-liao/Pytorch-UNet/commit/8ebac70e633bac59fc22bb5195e513d5832fb3bd
         x = torch.cat([x2, x1], dim=1)
+
+        print(f"concatted X: {x.shape}")
         return self.conv(x)
 
 
@@ -220,8 +237,7 @@ class UNet(nn.Module):
         x = self.up3(x, x2)
         x = self.up4(x, x1)
         logits = self.outc(x)
-        o = torch.clamp(logits,0,1)
-        return o
+        return logits
     def use_checkpointing(self):
         self.inc = torch.utils.checkpoint(self.inc)
         self.down1 = torch.utils.checkpoint(self.down1)
@@ -233,7 +249,18 @@ class UNet(nn.Module):
         self.up3 = torch.utils.checkpoint(self.up3)
         self.up4 = torch.utils.checkpoint(self.up4)
         self.outc = torch.utils.checkpoint(self.outc)
-    
+
+def YNet(nn.Module):
+    def __init__(self, bg_channels=3, obj_channels=3, n_classes=1, bilinear=False):
+        super(YNet, self).__init__()
+        self.bilinear = bilinear
+        self.bg_channels = bg_channels
+        self.obj_channels = obj_channels
+
+
+
+
+        
 def pad_to_n(img, n=500):
     down = n - img.shape[1]
     right = n - img.shape[2]
@@ -446,6 +473,30 @@ def kldiv(x, y):
     x = to_logspace(x)
     y = to_logspace(y)
     return sum([kl_div(input=x[i], target=y[i],log_target=True, reduction="sum") for i in range(len(x))])
+
+def dice_loss(pred, target, smooth=1):
+    """
+    Computes the Dice Loss for binary segmentation.
+    https://medium.com/data-scientists-diary/implementation-of-dice-loss-vision-pytorch-7eef1e438f68
+    Args:
+        pred: Tensor of predictions (batch_size, 1, H, W).
+        target: Tensor of ground truth (batch_size, 1, H, W).
+        smooth: Smoothing factor to avoid division by zero.
+    Returns:
+        Scalar Dice Loss.
+    """
+    # Apply sigmoid to convert logits to probabilities
+    pred = torch.sigmoid(pred)
+    
+    # Calculate intersection and union
+    intersection = (pred * target).sum(dim=(2, 3))
+    union = pred.sum(dim=(2, 3)) + target.sum(dim=(2, 3))
+    
+    # Compute Dice Coefficient
+    dice = (2. * intersection + smooth) / (union + smooth)
+    
+    # Return Dice Loss
+    return 1 - dice.mean()
 
 
 def train_loop(dataloader, model, loss_fn, optimizer, result_dict, t=None):

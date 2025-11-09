@@ -4,8 +4,8 @@
 --label_dir='dataset/OPA/new_OPA/new_train_label.csv' \
 --test_label_dir='dataset/OPA/new_OPA/new_test_label.csv' \
 --model='unet' \
---loss='kldiv' \
+--loss='dice' \
 --batch_size="8" \
 --obj_dir='dataset/OPA/new_OPA/foreground' \
---mask_dir='dataset/OPA/new_OPA/max' \
---lr='0.0005' --optim='adam' --epoch='25')
+--mask_dir='dataset/OPA/new_OPA/weighted' \
+--lr='0.0025' --optim='adam' --epoch='25')

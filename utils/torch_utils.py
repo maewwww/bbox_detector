@@ -152,10 +152,10 @@ class Down(nn.Module):
         )
 
     def forward(self, x):
-        print(f"\nDown module with in_c:{self.in_channels} and out_c:{self.out_channels}")
-        print(f"input shape: {x.shape}")
+        #print(f"\nDown module with in_c:{self.in_channels} and out_c:{self.out_channels}")
+        #print(f"input shape: {x.shape}")
         o = self.maxpool_conv(x)
-        print(f"output shape: {o.shape}")
+        #print(f"output shape: {o.shape}")
         return o
 
 
@@ -194,6 +194,53 @@ class Up(nn.Module):
         # https://github.com/HaiyongJiang/U-Net-Pytorch-Unstructured-Buggy/commit/0e854509c2cea854e247a9c615f175f76fbb2e3a
         # https://github.com/xiaopeng-liao/Pytorch-UNet/commit/8ebac70e633bac59fc22bb5195e513d5832fb3bd
         x = torch.cat([x2, x1], dim=1)
+
+        print(f"concatted X: {x.shape}")
+        return self.conv(x)
+    
+class MulUp(nn.Module):
+    """Up module with multiple inputs"""
+
+    def __init__(self, in_channels, out_channels, bilinear=True):
+        super().__init__()
+
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+
+        # if bilinear, use the normal convolutions to reduce the number of channels
+        if bilinear:
+            self.obj_up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
+            self.bg_up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
+            self.conv = DoubleConv(in_channels * 2, out_channels, in_channels // 2)
+        else:
+            self.obj_up = nn.ConvTranspose2d(in_channels, in_channels // 2, kernel_size=2, stride=2)
+            self.bg_up = nn.ConvTranspose2d(in_channels, in_channels // 2, kernel_size=2, stride=2)
+            self.conv = DoubleConv(in_channels * 2, out_channels, mid_channels=((in_channels+out_channels)//2))
+
+    def forward(self, x1, x2, x3, x4):
+        print(f"\nUp module, in_c={self.in_channels}, out_c={self.out_channels}")
+        print(f"x1 shape BEFORE up {x1.shape}")
+        print(f"x3 shape BEFORE up {x3.shape}")
+        x1 = self.obj_up(x1)
+        x3 = self.bg_up(x3)
+        print(f"x1 shape AFTER up {x1.shape}")
+        print(f"x3 shape AFTER up {x3.shape}")
+        print(f"x2 shape {x2.shape}")
+        # input is CHW
+        diffY = x2.size()[2] - x1.size()[2]
+        diffX = x2.size()[3] - x1.size()[3]
+
+        x1 = F.pad(x1, [diffX // 2, diffX - diffX // 2,
+                        diffY // 2, diffY - diffY // 2])
+        x3 = F.pad(x3, [diffX // 2, diffX - diffX // 2,
+                        diffY // 2, diffY - diffY // 2])
+        
+        print(f"x1 PATCHED shape {x1.shape}")
+        print(f"x3 PATCHED shape {x3.shape}")
+        # if you have padding issues, see
+        # https://github.com/HaiyongJiang/U-Net-Pytorch-Unstructured-Buggy/commit/0e854509c2cea854e247a9c615f175f76fbb2e3a
+        # https://github.com/xiaopeng-liao/Pytorch-UNet/commit/8ebac70e633bac59fc22bb5195e513d5832fb3bd
+        x = torch.cat([x2, x1, x4, x3], dim=1)
 
         print(f"concatted X: {x.shape}")
         return self.conv(x)
@@ -250,17 +297,69 @@ class UNet(nn.Module):
         self.up4 = torch.utils.checkpoint(self.up4)
         self.outc = torch.utils.checkpoint(self.outc)
 
-def YNet(nn.Module):
+class YNet(nn.Module):
     def __init__(self, bg_channels=3, obj_channels=3, n_classes=1, bilinear=False):
         super(YNet, self).__init__()
         self.bilinear = bilinear
         self.bg_channels = bg_channels
         self.obj_channels = obj_channels
+        
+        self.bg_in = (DoubleConv(bg_channels, 64))
+        self.obj_in = (DoubleConv(obj_channels, 64))
 
+        factor = 2 if bilinear else 1
 
+        self.bg_down1 = (Down(64, 128))
+        self.bg_down2 = (Down(128, 256))
+        self.bg_down3 = (Down(256, 512 // factor))
+        self.obj_down1 = (Down(64, 128))
+        self.obj_down2 = (Down(128, 256))
+        self.obj_down3 = (Down(256, 512 // factor))
+        # self.down4 = (Down(512, 1024 // factor))
+        self.up1 = (MulUp(512, 256 // factor, bilinear))
+        self.up2 = (MulUp(256, 128 // factor, bilinear))
+        self.up3 = (MulUp(128, 64, bilinear))
+        self.outc = (OutConv(64, n_classes))
+    
+    def forward(self, x):
+        fg = x[:, :3, :, :]
+        bg = x[:, 3:, :, :]
+
+        x1_1 = self.obj_in(fg)
+        x1_2 = self.obj_down1(x1_1)
+        x1_3 = self.obj_down2(x1_2)
+        x1_4 = self.obj_down3(x1_3)
+
+        x2_1 = self.bg_in(bg)
+        x2_2 = self.obj_down1(x2_1)
+        x2_3 = self.obj_down2(x2_2)
+        x2_4 = self.obj_down3(x2_3)
+
+        x = self.up1(x1_4, x1_3, x2_4, x2_3)
+        x = self.up2(x, x1_2, x2_3, x2_2)
+        x = self.up3(x, x1_1, x2_2, x2_1)
+        logits = self.outc(x)
+        return logits
+    
+    def use_checkpointing(self):
+        self.bg_in = torch.utils.checkpoint(self.bg_in)
+        self.obj_in = torch.utils.checkpoint(self.obj_in)
+        self.obj_down1 = torch.utils.checkpoint(self.obj_down1)
+        self.obj_down2 = torch.utils.checkpoint(self.obj_down2)
+        self.obj_down3 = torch.utils.checkpoint(self.obj_down3)
+        self.bg_down1 = torch.utils.checkpoint(self.bg_down1)
+        self.bg_down2 = torch.utils.checkpoint(self.bg_down2)
+        self.bg_down3 = torch.utils.checkpoint(self.bg_down3)
+        self.up1 = torch.utils.checkpoint(self.up1)
+        self.up2 = torch.utils.checkpoint(self.up2)
+        self.up3 = torch.utils.checkpoint(self.up3)
+        self.outc = torch.utils.checkpoint(self.outc)
 
 
         
+
+
+
 def pad_to_n(img, n=500):
     down = n - img.shape[1]
     right = n - img.shape[2]

@@ -16,6 +16,9 @@ def get_dataset(dataloader, img_dir, label_dir, obj_dir, model, mask_dir):
         case "unet":
             transform = unet_preprocess
             target_transform = unet_target_preprocess
+        case "ynet":
+            transform = unet_preprocess
+            target_transform = unet_target_preprocess
 
     
     match dataloader:
@@ -41,6 +44,8 @@ def get_model(model):
             return OneOutLRASPP()
         case "unet":
             return UNet(n_channels=6, n_classes=1)
+        case "ynet":
+            return YNet(bg_channels=3, obj_channels=3, n_classes=1, bilinear=False)
         
 def get_loss(loss):
     match loss:
@@ -63,7 +68,7 @@ def main(dataloader, img_dir, label_dir, mask_dir, model, loss,
          lr, optim, epoch, test_label_dir=None,
          batch_size="16", obj_dir=None):
     dataloaders = ["one_channel", "two_channel", "OPA", "OPA_Dist"]
-    models = ["double_resnet50", "lraspp", "unet"]
+    models = ["double_resnet50", "lraspp", "unet", "ynet"]
     losses = ["mse", "var_mse_min", "kldiv", "dice"]
     optims = ["adam"]
 
@@ -105,6 +110,8 @@ def main(dataloader, img_dir, label_dir, mask_dir, model, loss,
 
     model = get_model(model)
     model.to(gpu)
+    print("total", sum(p.numel() for p in model.parameters())) 
+    #print("trainable", pytorch_total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)) 
     loss = get_loss(loss)
     optim = get_optim(optim,model,lr)
 

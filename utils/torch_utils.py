@@ -113,11 +113,6 @@ class DoubleResnet50(nn.Module):
         o = self.fc2(f) # (N, 4)
 
         return o
-    
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-
 
 class DoubleConv(nn.Module):
     """(convolution => [BN] => ReLU) * 2"""
@@ -218,31 +213,36 @@ class MulUp(nn.Module):
             self.conv = DoubleConv(in_channels * 2, out_channels, mid_channels=((in_channels+out_channels)//2))
 
     def forward(self, x1, x2, x3, x4):
-        print(f"\nUp module, in_c={self.in_channels}, out_c={self.out_channels}")
-        print(f"x1 shape BEFORE up {x1.shape}")
-        print(f"x3 shape BEFORE up {x3.shape}")
+        #print(f"\nUp module, in_c={self.in_channels}, out_c={self.out_channels}")
+        #print(f"x1 shape BEFORE up {x1.shape}")
+        #print(f"x3 shape BEFORE up {x3.shape}")
         x1 = self.obj_up(x1)
         x3 = self.bg_up(x3)
-        print(f"x1 shape AFTER up {x1.shape}")
-        print(f"x3 shape AFTER up {x3.shape}")
-        print(f"x2 shape {x2.shape}")
+        #print(f"x1 shape AFTER up {x1.shape}")
+        #print(f"x3 shape AFTER up {x3.shape}")
+        #print(f"x2 shape {x2.shape}")
         # input is CHW
-        diffY = x2.size()[2] - x1.size()[2]
+        """diffY = x2.size()[2] - x1.size()[2]
         diffX = x2.size()[3] - x1.size()[3]
 
         x1 = F.pad(x1, [diffX // 2, diffX - diffX // 2,
                         diffY // 2, diffY - diffY // 2])
         x3 = F.pad(x3, [diffX // 2, diffX - diffX // 2,
                         diffY // 2, diffY - diffY // 2])
-        
-        print(f"x1 PATCHED shape {x1.shape}")
-        print(f"x3 PATCHED shape {x3.shape}")
+        """
+        #print(f"x1 PATCHED shape {x1.shape}")
+        #print(f"x3 PATCHED shape {x3.shape}")
         # if you have padding issues, see
         # https://github.com/HaiyongJiang/U-Net-Pytorch-Unstructured-Buggy/commit/0e854509c2cea854e247a9c615f175f76fbb2e3a
         # https://github.com/xiaopeng-liao/Pytorch-UNet/commit/8ebac70e633bac59fc22bb5195e513d5832fb3bd
         x = torch.cat([x2, x1, x4, x3], dim=1)
+        del x1
+        del x2
+        del x3
+        del x4
+        torch.cuda.empty_cache()
 
-        print(f"concatted X: {x.shape}")
+        #print(f"concatted X: {x.shape}")
         return self.conv(x)
 
 
@@ -355,8 +355,40 @@ class YNet(nn.Module):
         self.up3 = torch.utils.checkpoint(self.up3)
         self.outc = torch.utils.checkpoint(self.outc)
 
+def base_vit_6_channels():
+    "modified ViT_B_16 with 6 input channels and 4 output nodes"
+    model = torchvision.models.vit_b_16(weights="IMAGENET1K_SWAG_E2E_V1") 
+    new_conv_proj = torch.nn.modules.Conv2d(6, 768, kernel_size=(16, 16), stride=(16, 16))
+    new_head = torch.nn.modules.Linear(in_features=768, out_features=4, bias=True)
+    old_conv_weight = model.conv_proj.weight
+    with torch.no_grad():
+        new_conv_proj.weight[:, :3, :, :], new_conv_proj.weight[:, 3:, :, :] = old_conv_weight,old_conv_weight
+    model.conv_proj = new_conv_proj
+    model.heads.head = new_head
+    return model
 
+class fusion_v2(nn.Module):
+    def __init__(self):
+        super(fusion_v2, self).__init__()
+        self.vit = torchvision.models.vit_b_16(weights="IMAGENET1K_SWAG_E2E_V1")
+        self.vit.head = torch.nn.Identity()
+        self.en = torchvision.models.efficientnet_v2_s(weights="IMAGENET1K_V1")
+        self.en.classifier = torch.nn.Identity()
+        self.linear = torch.nn.Linear(2280, 1024, bias=True)
+        self.head = torch.nn.Linear(1024, 4, bias=True)
+
+    def forward(self, x):
+        bg = x[:, :3, :, :]
+        fg = x[:, 3:, :, :]
+
+        bg = self.vit(bg)
+        fg = self.en(fg)
+
+        x = torch.cat((bg,fg),1)
         
+        x = self.linear(x)
+        x = self.head(x)
+        return x
 
 
 
@@ -386,14 +418,27 @@ LRASPP_target_preprocess = torchvision.transforms.Compose([
 
 unet_preprocess = torchvision.transforms.Compose([
     pad_to_640,
-    Resize([520,520]),
+    Resize([512,512]),
     normalize_mask
 ])
 
 unet_target_preprocess = torchvision.transforms.Compose([
     pad_to_640,
-    Resize([520,520],interpolation=torchvision.transforms.InterpolationMode.NEAREST),
+    Resize([512,512],interpolation=torchvision.transforms.InterpolationMode.NEAREST),
     normalize_mask
+])
+
+vit_transform = torchvision.transforms.Compose([
+    pad_to_640,
+    Resize([384,384], interpolation=torchvision.transforms.InterpolationMode.BILINEAR),
+    #normalize_mask,
+    torchvision.transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+])
+
+efficient_net_transform = torchvision.transforms.Compose([
+    Resize((384,)),
+    #normalize_mask,
+    torchvision.transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
 ])
         
 # Subset of VOC'2012 with object removed that CONTAIN 2 IMAGES
@@ -436,7 +481,7 @@ class OPADataset(Dataset):
             self.bbox_label = f.readlines()
         self.pad_label = 55 # length of label (see how label is padded in __getitem__)
         self.img_pad_size = 640
-        self.img_size = [512, 512] # target size of image
+        self.img_size = [384, 384] # target size of image
         self.img_dir = img_dir
         self.obj_dir = obj_dir
         self.transform = transform
@@ -469,7 +514,7 @@ class OPADataset(Dataset):
         while len(label) < self.pad_label:
             label.append([float('inf')]*4)
         label = torch.tensor(label).type(torch.float32)
-        # Dimension of label is (n, 4) where we pad label to conain n = self.pad_label bboxes.
+        # Dimension of (each) label is (n, 4) where we pad label to conain n = self.pad_label bboxes.
         # Example: [[x1, y1, w1, h1],
         #           [x2, y2, w2, h2],
         #           ...
@@ -477,14 +522,69 @@ class OPADataset(Dataset):
 
         resize = Resize(self.img_size)
         if self.transform:
-            image = resize(
-                pad_to_n(self.transform(image), self.img_pad_size)
-            )
-            obj = resize(
-                pad_to_n(self.transform(obj), self.img_pad_size)
-            )
+            image = self.transform(image)
+            obj = self.transform(obj)
         if self.target_transform:
             label = self.target_transform(label)
+        #print(image.shape)
+        #print(obj.shape)
+        example = torch.cat((image,obj),0)
+        
+        return example.to(gpu), label.to(gpu), name
+    
+class OPADataset_2(Dataset):
+    def __init__(self, label_dir, img_dir, obj_dir, transform=None, target_transform=None, obj_transform=None):
+        with open(label_dir, "r") as f:
+            self.bbox_label = f.readlines()
+        self.pad_label = 55 # length of label (see how label is padded in __getitem__)
+        self.img_pad_size = 640
+        self.img_size = [384, 384] # target size of image
+        self.img_dir = img_dir
+        self.obj_dir = obj_dir
+        self.transform = transform
+        self.obj_transform = obj_transform
+        self.target_transform = target_transform
+        self.resize_ratio = self.img_size[0] / self.img_pad_size
+
+    def __len__(self):
+        return len(self.bbox_label)
+
+    def __getitem__(self, idx):
+        label_line = self.bbox_label[idx].split(",")
+        img_id = label_line[1]
+        obj_id = label_line[0]
+        img_name = img_id + ".jpg"
+        obj_name = obj_id + ".jpg"
+        cat = label_line[2]
+        name = obj_id + "c" + img_id
+
+        img_path = os.path.join(self.img_dir, cat, img_name)
+        obj_path = os.path.join(self.obj_dir, cat, obj_name)       
+        image = decode_image(img_path).type(torch.float32)
+        obj = decode_image(obj_path).type(torch.float32)
+
+        label = label_line[3:]
+        label = [float(x) for x in label]
+        label = n_slice(label, 4)
+        for sublabel in label:
+            for i, element in enumerate(sublabel):
+                sublabel[i] = element * self.resize_ratio
+        while len(label) < self.pad_label:
+            label.append([float('inf')]*4)
+        label = torch.tensor(label).type(torch.float32)
+        # Dimension of (each) label is (n, 4) where we pad label to conain n = self.pad_label bboxes.
+        # Example: [[x1, y1, w1, h1],
+        #           [x2, y2, w2, h2],
+        #           ...
+        #           [xn, yn, wn, hn]]
+
+        if self.transform:
+            image = self.transform(image)
+            obj = self.obj_transform(obj)
+        if self.target_transform:
+            label = self.target_transform(label)
+        #print(image.shape)
+        #print(obj.shape)
         example = torch.cat((image,obj),0)
         
         return example.to(gpu), label.to(gpu), name
@@ -525,7 +625,7 @@ class OPADistDataset(Dataset):
             label = self.target_transform(mask)
         example = torch.cat((image,obj),0)
         
-        return example.to(gpu), label.to(gpu), comp_name
+        return example, label, comp_name
     
 def get_imgname(revoc, img):
     for idx in range(len(revoc)):
@@ -555,6 +655,9 @@ def var_mse_min(pred, label):
         sublabel = label[i]
 
         for candidate in sublabel:
+
+            if candidate[0].item() == float('inf'):
+                break
             
             #print(f"Calculating loss between {subpred} and {candidate}")
             loss = mse(subpred, candidate)
@@ -604,6 +707,8 @@ def train_loop(dataloader, model, loss_fn, optimizer, result_dict, t=None):
     total_loss = 0
     for batch, (X, y, _) in enumerate(dataloader):
         # Compute prediction and loss
+        X = X.to(gpu)
+        y = y.to(gpu)
         pred = model(X)
         loss = loss_fn(pred, y)
         total_loss += loss.item()
@@ -632,6 +737,8 @@ def test_loop(dataloader, model, loss_fn,result_dict, t=None):
 
     with torch.no_grad():
         for X, y,_ in dataloader:
+            X = X.to(gpu)
+            y = y.to(gpu)
             pred = model(X)
             test_loss += loss_fn(pred, y).item()    
     print(f"epoch: {t + 1}, avg test loss: {test_loss/batch_num}")

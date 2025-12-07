@@ -4,3 +4,4 @@
 train.sh
 /utils/__pycache__
 /local_output
+/tmp

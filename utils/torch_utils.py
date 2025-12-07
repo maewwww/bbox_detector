@@ -4,6 +4,8 @@ import os
 import cv2
 import pandas as pd
 import matplotlib.pyplot as plt
+import scipy
+import time
 
 import torchvision
 import torch.nn as nn
@@ -389,6 +391,134 @@ class fusion_v2(nn.Module):
         x = self.linear(x)
         x = self.head(x)
         return x
+    
+class ENEncoder(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.en = torchvision.models.efficientnet_v2_s(weights="IMAGENET1K_V1")
+        self.linear = nn.Linear(1280, 768)
+
+    def forward(self, x):
+        x = self.en.features(x)
+        x = torch.flatten(x,start_dim=-2)
+        x = torch.permute(x, (0,2,1))
+        x = self.linear(x)
+        return x
+    
+class ViTEncoder(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.vit = torchvision.models.vit_b_16(weights="IMAGENET1K_SWAG_E2E_V1")
+
+    def forward(self, x):
+        x = self.vit._process_input(x)
+        n = x.shape[0]
+
+        # Expand the class token to the full batch
+        batch_class_token = self.vit.class_token.expand(n, -1, -1)
+        x = torch.cat([batch_class_token, x], dim=1)
+
+        x = self.vit.encoder(x)
+        return x
+    
+class CrossAttention(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.fg_norm = nn.LayerNorm(768)
+        self.bg_norm = nn.LayerNorm(768)
+        self.fg_norm2 = nn.LayerNorm(768)
+        self.mha = nn.MultiheadAttention(embed_dim=768, num_heads=8, batch_first=True)
+        self.mlp = nn.Sequential(
+            nn.Linear(768, 3072),
+            nn.GELU(),
+            # dropout
+            nn.Linear(3072, 768)
+        )
+    def forward(self, fg, bg):
+        fg = self.fg_norm(fg)
+        bg = self.bg_norm(bg)
+        
+        attn_out, _ = self.mha(fg, bg, bg, need_weights=False)
+
+        fg = fg + attn_out
+        fg = fg + self.mlp(self.fg_norm2(fg))
+
+        return fg
+    
+class Decoder(nn.Module):
+    def __init__(self, num_queries, N):
+        super().__init__()
+        self.N = N
+        self.query = nn.Embedding(num_queries, 768)
+        self.self_attn = nn.MultiheadAttention(embed_dim=768, num_heads=8, batch_first=True)
+        self.cross_attn = nn.MultiheadAttention(embed_dim=768, num_heads=8, batch_first=True)
+        self.norm1 = nn.LayerNorm(768)
+        self.norm2 = nn.LayerNorm(768)
+        self.norm3 = nn.LayerNorm(768)
+        self.norm4 = nn.LayerNorm(768)
+        self.mlp1 = nn.Sequential(
+            nn.Linear(768, 1536),
+            nn.GELU(),
+            # dropout
+            nn.Linear(1536, 768)
+        )
+        self.mlp2 = nn.Sequential(
+            nn.Linear(768, 2048),
+            nn.ReLU(),
+            # dropout
+            nn.Linear(2048, 768)
+        )
+
+    def forward(self, fg):
+        q = self.query.weight.unsqueeze(1).repeat(1, fg.shape[0], 1).transpose(0, 1) # (N, q, 4)
+        nq = self.norm1(q)
+
+        s_attn_out, _ = self.self_attn(nq, nq, nq, need_weights=False)
+        q = q + s_attn_out
+        q = q + self.mlp1(self.norm2(q))
+        c_attn_out, _ = self.cross_attn(q, fg, fg, need_weights=False)
+        q = q + c_attn_out
+        q = q + self.mlp2(self.norm3(q))
+
+        return self.norm4(q)
+
+    
+class fusion_v3(nn.Module):
+    def __init__(self, num_queries, batch_size):
+        super(fusion_v3, self).__init__()
+        self.vit = ViTEncoder()
+        self.en = ENEncoder()
+        self.attn = CrossAttention()
+        self.decoder = Decoder(num_queries=num_queries, N=batch_size)
+        self.head = nn.Linear(768, 4)
+
+    def forward(self, x):
+
+        # N = batch size
+        # D = embedding dim = 768     
+        # Q = number of queries   
+
+        bg = x[:, :3, :, :] # (N, 3, H, W)
+        fg = x[:, 3:, :, :] # (N, 3, H, W)
+
+        bg = self.vit(bg) # (N, 577, D)
+        fg = self.en(fg) # (N, 144, D)
+        if torch.isnan(fg).any():
+            print("nan before self attn")
+        fg = self.attn(fg, bg) # (N, 144, D)
+        if torch.isnan(fg).any():
+            print("nan after self attn")
+
+        query = self.decoder(fg) # (N, Q, D)
+        if torch.isnan(query).any():
+            print("nan after decoder")
+        o = self.head(query) # (N, Q, 4)
+        if torch.isnan(o).any():
+            print("nan after head")
+
+        return o
+
+
 
 
 
@@ -397,6 +527,13 @@ def pad_to_n(img, n=500):
     right = n - img.shape[2]
     pad = Pad((0,0,right,down))
     return pad(img)
+
+def square_pad(img):
+    h, w = img.shape[1], img.shape[2]
+    if h > w:
+        return Pad((0, 0, h - w, 0))(img)
+    else:
+        return Pad((0, 0, 0, w - h))(img)
 
 def pad_to_640(img):
     return pad_to_n(img, 640)
@@ -437,6 +574,13 @@ vit_transform = torchvision.transforms.Compose([
 
 efficient_net_transform = torchvision.transforms.Compose([
     Resize((384,)),
+    #normalize_mask,
+    torchvision.transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+])
+
+vit_transform_2 = torchvision.transforms.Compose([
+    square_pad,
+    Resize([384,384], interpolation=torchvision.transforms.InterpolationMode.BILINEAR),
     #normalize_mask,
     torchvision.transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
 ])
@@ -640,6 +784,141 @@ resnet_preprocess = torchvision.transforms.Compose([
     torchvision.transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
 ])
 
+def matcher(outputs, targets):
+    """
+    Finds the optimal matching between the set of outputs and targets.
+
+    This snippet is taken from the original code:
+    https://github.com/facebookresearch/detr/blob/main/models/matcher.py
+
+    outputs: This is a dict that contains at least these entries:
+        1. "pred_logits": Tensor [batch_size, num_queries, num_classes]
+        with the classification logits. 
+        num_queries = 100 by default.
+        2. "pred_boxes": Tensor [batch_size, num_queries, 4] with the
+            predicted box coordinates.
+
+    targets: This is a list of targets (len(targets) = batch_size), 
+        where each target is a dict containing:
+        1. "labels": Tensor [num_target_boxes] (where num_target_boxes
+            is the number of ground-truth objects in the target) 
+            containing the class labels
+        2. "boxes": Tensor of dim [num_target_boxes, 4] containing the 
+            target box coordinates
+    """
+    # Step 1. Prepare outputs and targets for matching.
+    # By default num_queries = 100.
+    # batch_size must be at least 1.
+    batch_size, num_queries = outputs["pred_logits"].shape[:2]
+
+    # Flatten to compute the cost matrices in a batch.
+    # [batch_size * num_queries, num_classes].
+    out_prob = outputs["pred_logits"].flatten(0, 1).softmax(-1) 
+    # [batch_size * num_queries, 4].
+    out_bbox = outputs["pred_boxes"].flatten(0, 1)
+
+    # [num_target_boxes]
+    tgt_ids = torch.cat([v["labels"] for v in targets])
+    # [num_target_boxes]
+    tgt_bbox = torch.cat([v["boxes"] for v in targets])
+
+
+    # Step 2. Compute the classification and bounding box losses.
+    # Compute the classification cost using 1 - proba[target class].
+    # 1 is a constant that does not change the matching, 
+    # and can be ommitted.
+    # We only consider the object classes present in the current
+    # batch of targets. 
+    # [batch_size * num_queries, len(unique(tgt_ids))],
+    # where len(unique(tgt_ids)) < num_classes.
+    cost_class = -out_prob[:, tgt_ids]
+
+    # Compute the L1 distance between boxes. The L1 distance is more 
+    # robust to outliers than the L2 distance.
+    cost_bbox = torch.cdist(out_bbox, tgt_bbox, p=1) # (N, q, 4)
+    # Compute the giou cost betwen boxes.
+    cost_giou = -generalized_box_iou(
+        box_cxcywh_to_xyxy(out_bbox), box_cxcywh_to_xyxy(tgt_bbox)
+    )
+
+    # Final classification + bounding box cost matrix.
+    C = cost_bbox + cost_class + cost_giou
+    C = C.view(batch_size, num_queries, -1).cpu()
+
+
+    # Step 3. Perform matching using the Hungarian algorithm 
+    # (linear sum assignment). The resulting indices are the optimal
+    # assignments between the predictions and targets. These indices
+    # are passed on to the loss function downstream to calculate the
+    # losses for back propagation.
+    sizes = [len(v["boxes"]) for v in targets]
+    indices = [
+        linear_sum_assignment(c[i]) 
+        for i, c in enumerate(C.split(sizes, -1))
+    ]
+
+    # Returns a list of size batch_size, containing tuples of 
+    # (index_i, index_j) where:
+    #   - index_i is the indices of the selected predictions (in order)
+    #   - index_j is the indices of the corresponding selected targets 
+    #     (in order)
+    return [
+        (
+            torch.as_tensor(i, dtype=torch.int64), 
+            torch.as_tensor(j, dtype=torch.int64)
+        ) for i, j in indices
+    ]
+
+def matching_loss(pred, target, loss=None):
+    """ pred: tensor (N, q, 4)
+        target: tensor (N, q, 4)"""
+    if loss is None:
+        loss = torchvision.ops.complete_box_iou_loss
+    N, q = pred.shape[:2]
+    batch_loss = list()
+    pred[:, :, [1, 3]] = pred[:, :, [3, 1]]
+    target[:, :, [1, 3]] = target[:, :, [3, 1]]
+    for k in range(N):
+        current_loss = list()
+        _pred = pred[k]
+        _tgt = target[k]
+        loss_matrix = torch.zeros((q, q))
+        for i in range(q):
+            for j in range(q):
+                if _tgt[j][0] == float("inf"):
+                    continue
+                    #loss_matrix[i][j] = 0 
+                else:
+                    loss_matrix[i][j] = loss(_pred[i], _tgt[j]).item()
+        try:
+            row_idx, col_idx = scipy.optimize.linear_sum_assignment(loss_matrix)
+        except:
+            print("matrix")
+            for l in loss_matrix:
+                print(l)
+            print("pred")
+            for p in _pred:
+                print(p)
+            for t in _tgt:
+                print(t)
+        non_zero_count = 0
+
+        opt_pred = []
+        opt_tgt = []
+        for i in range(q):
+            row, col = row_idx[i], col_idx[i]
+            if _tgt[col][0] == float("inf"):
+                continue
+            else:
+                opt_pred.append(_pred[row])
+                opt_tgt.append(_tgt[col])
+        opt_pred = torch.stack(opt_pred, dim=0)
+        opt_tgt = torch.stack(opt_tgt, dim=0)
+        
+        batch_loss.append(loss(opt_pred, opt_tgt, reduction="mean"))
+    return sum(batch_loss) / N
+
+
 def var_mse_min(pred, label):
     """perform mse for each sublabel in label and return the minimum one"""
 
@@ -707,10 +986,14 @@ def train_loop(dataloader, model, loss_fn, optimizer, result_dict, t=None):
     total_loss = 0
     for batch, (X, y, _) in enumerate(dataloader):
         # Compute prediction and loss
+        start_forward = time.time()
         X = X.to(gpu)
         y = y.to(gpu)
         pred = model(X)
+        #print("forward pass: ", time.time() - start_forward)
+        start_loss = time.time()
         loss = loss_fn(pred, y)
+        #print("calculate loss: ", time.time() - start_loss)
         total_loss += loss.item()
 
         # Backpropagation
@@ -718,12 +1001,17 @@ def train_loop(dataloader, model, loss_fn, optimizer, result_dict, t=None):
         #loss.to(gpu)
         #print(loss)
         #print()
+        start_backward = time.time()
         loss.backward()
+        #print("backward: ", time.time() - start_backward)
         """
         for each_loss in loss:
             each_loss.backward(retain_graph=True)"""
+        
+        start_step = time.time()
         optimizer.step()
         optimizer.zero_grad()
+        #print("opt step: ", time.time() - start_step)
     print(f"epoch: {t + 1}, avg train loss: {total_loss/batch_num}")
     #print(f"pred shape: ",pred["out"].shape)
     #print(f"y shape: {y.shape}")
@@ -745,7 +1033,7 @@ def test_loop(dataloader, model, loss_fn,result_dict, t=None):
     #print(f"pred shape: ",pred["out"].shape)
     #print(f"y shape: {y.shape}")
     if t is not None:
-        result_dict[t]["test"] = test_loss # edit dict because we run test AFTER train in each epoch
+        result_dict[t]["test"] = test_loss/batch_num # edit dict because we run test AFTER train in each epoch
 
 def save_eval(dataset, model, loss_fn, full_dataset=None, out_dir="output/"):
     # Do prediction one by one so we can save result

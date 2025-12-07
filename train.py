@@ -23,8 +23,12 @@ def get_dataset(dataloader, img_dir, label_dir, obj_dir, model, mask_dir):
             transform = vit_transform
             target_transform = None
         case "fusion_2":
+            transform = vit_transform_2
+            obj_transform = vit_transform_2 #efficient_net_transform
+            target_transform = None
+        case "fusion_3":
             transform = vit_transform
-            obj_transform = vit_transform #efficient_net_transform
+            obj_transform = vit_transform_2
             target_transform = None
 
     
@@ -46,7 +50,7 @@ def get_dataset(dataloader, img_dir, label_dir, obj_dir, model, mask_dir):
             return OPADataset_2(label_dir=label_dir, img_dir=img_dir, obj_dir=obj_dir,
                                   transform=transform, target_transform=target_transform, obj_transform=obj_transform)
 
-def get_model(model):
+def get_model(model, batch_size=8):
     match model:
         case "double_resnet50":
             return DoubleResnet50()
@@ -60,6 +64,8 @@ def get_model(model):
             return base_vit_6_channels()
         case "fusion_2":
             return fusion_v2()
+        case "fusion_3":
+            return fusion_v3(55, batch_size)
 def get_loss(loss):
     match loss:
         case "mse":
@@ -70,6 +76,8 @@ def get_loss(loss):
             return kldiv
         case "dice":
             return dice_loss
+        case "matching":
+            return matching_loss
         
 def get_optim(optim, model, lr):
     match optim:
@@ -81,9 +89,11 @@ def main(dataloader, img_dir, label_dir, mask_dir, model, loss,
          lr, optim, epoch, test_label_dir=None,
          batch_size="16", obj_dir=None):
     dataloaders = ["one_channel", "two_channel", "OPA", "OPA_Dist", "OPA_2"]
-    models = ["double_resnet50", "lraspp", "unet", "ynet", "b_vit", "fusion_2"]
-    losses = ["mse", "var_mse_min", "kldiv", "dice"]
+    models = ["double_resnet50", "lraspp", "unet", "ynet", "b_vit", "fusion_2", "fusion_3"]
+    losses = ["mse", "var_mse_min", "kldiv", "dice", "matching"]
     optims = ["adam"]
+    #torch.multiprocessing.set_start_method('spawn')
+    #torch.autograd.set_detect_anomaly(True)
 
     assert dataloader in dataloaders, "Unknown Dataloader"
     print(f"{dataloader} is chosen as dataloader")
@@ -121,12 +131,14 @@ def main(dataloader, img_dir, label_dir, mask_dir, model, loss,
         dataset = get_dataset(dataloader, img_dir, label_dir, obj_dir, model)
         train_dataset, test_dataset = torch.utils.data.random_split(dataset, [0.8, 0.2])
 
-    model = get_model(model)
+    model = get_model(model, batch_size)
+    #model.load_state_dict(torch.load("checkpoint.pt", weights_only=True))
     model.to(gpu)
     print("parameters:", sum(p.numel() for p in model.parameters())) 
     #print("trainable", pytorch_total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)) 
     loss = get_loss(loss)
     optim = get_optim(optim,model,lr)
+    #torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 
     train_dataloader = DataLoader(train_dataset, batch_size=batch_size)
     test_dataloader = DataLoader(test_dataset, batch_size=batch_size)
@@ -140,7 +152,7 @@ def main(dataloader, img_dir, label_dir, mask_dir, model, loss,
         print("-------------------------------\n")
 
         # save intermediate model every 10 epochs
-        if t != 1 and t % 10 == 0:
+        if t != 1 and t % 3 == 0:
             i_modelname = str(t + 1) + "weight.pt"
             torch.save(model.state_dict(), i_modelname)
             print("Model weight saved to ", i_modelname)

@@ -6,6 +6,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import scipy
 import time
+import math
 
 import torchvision
 import torch.nn as nn
@@ -299,64 +300,6 @@ class UNet(nn.Module):
         self.up4 = torch.utils.checkpoint(self.up4)
         self.outc = torch.utils.checkpoint(self.outc)
 
-class YNet(nn.Module):
-    def __init__(self, bg_channels=3, obj_channels=3, n_classes=1, bilinear=False):
-        super(YNet, self).__init__()
-        self.bilinear = bilinear
-        self.bg_channels = bg_channels
-        self.obj_channels = obj_channels
-        
-        self.bg_in = (DoubleConv(bg_channels, 64))
-        self.obj_in = (DoubleConv(obj_channels, 64))
-
-        factor = 2 if bilinear else 1
-
-        self.bg_down1 = (Down(64, 128))
-        self.bg_down2 = (Down(128, 256))
-        self.bg_down3 = (Down(256, 512 // factor))
-        self.obj_down1 = (Down(64, 128))
-        self.obj_down2 = (Down(128, 256))
-        self.obj_down3 = (Down(256, 512 // factor))
-        # self.down4 = (Down(512, 1024 // factor))
-        self.up1 = (MulUp(512, 256 // factor, bilinear))
-        self.up2 = (MulUp(256, 128 // factor, bilinear))
-        self.up3 = (MulUp(128, 64, bilinear))
-        self.outc = (OutConv(64, n_classes))
-    
-    def forward(self, x):
-        fg = x[:, :3, :, :]
-        bg = x[:, 3:, :, :]
-
-        x1_1 = self.obj_in(fg)
-        x1_2 = self.obj_down1(x1_1)
-        x1_3 = self.obj_down2(x1_2)
-        x1_4 = self.obj_down3(x1_3)
-
-        x2_1 = self.bg_in(bg)
-        x2_2 = self.obj_down1(x2_1)
-        x2_3 = self.obj_down2(x2_2)
-        x2_4 = self.obj_down3(x2_3)
-
-        x = self.up1(x1_4, x1_3, x2_4, x2_3)
-        x = self.up2(x, x1_2, x2_3, x2_2)
-        x = self.up3(x, x1_1, x2_2, x2_1)
-        logits = self.outc(x)
-        return logits
-    
-    def use_checkpointing(self):
-        self.bg_in = torch.utils.checkpoint(self.bg_in)
-        self.obj_in = torch.utils.checkpoint(self.obj_in)
-        self.obj_down1 = torch.utils.checkpoint(self.obj_down1)
-        self.obj_down2 = torch.utils.checkpoint(self.obj_down2)
-        self.obj_down3 = torch.utils.checkpoint(self.obj_down3)
-        self.bg_down1 = torch.utils.checkpoint(self.bg_down1)
-        self.bg_down2 = torch.utils.checkpoint(self.bg_down2)
-        self.bg_down3 = torch.utils.checkpoint(self.bg_down3)
-        self.up1 = torch.utils.checkpoint(self.up1)
-        self.up2 = torch.utils.checkpoint(self.up2)
-        self.up3 = torch.utils.checkpoint(self.up3)
-        self.outc = torch.utils.checkpoint(self.outc)
-
 def base_vit_6_channels():
     "modified ViT_B_16 with 6 input channels and 4 output nodes"
     model = torchvision.models.vit_b_16(weights="IMAGENET1K_SWAG_E2E_V1") 
@@ -369,26 +312,104 @@ def base_vit_6_channels():
     model.heads.head = new_head
     return model
 
+class Head(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.fc = nn.Linear(2048, 1024)
+        self.dropout = nn.Dropout(p=0.2)
+        self.relu = nn.ReLU()
+        self.out = nn.Linear(1024, 2)
+        
+
+    def forward(self, x):
+        x = self.fc(x)
+        x = self.dropout(x)
+        x = self.relu(x)
+        x = self.out(x)
+        return x
+    
+class ResnetEncoder(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.backbone = torchvision.models.resnet101(weights="DEFAULT")        
+
+    def forward(self, x):
+        x = self.backbone.conv1(x)
+        x = self.backbone.bn1(x)
+        x = self.backbone.relu(x)
+        x = self.backbone.maxpool(x)
+
+        x = self.backbone.layer1(x)
+        x = self.backbone.layer2(x)
+        x = self.backbone.layer3(x)
+        x = self.backbone.layer4(x)
+
+        #x = self.backbone.avgpool(x)
+        return x
+
 class fusion_v2(nn.Module):
     def __init__(self):
         super(fusion_v2, self).__init__()
-        self.vit = torchvision.models.vit_b_16(weights="IMAGENET1K_SWAG_E2E_V1")
-        self.vit.head = torch.nn.Identity()
+        #self.vit = torchvision.models.vit_b_16(weights="IMAGENET1K_SWAG_E2E_V1")
+        #self.vit.head = torch.nn.Identity()
+        self.resnet = torchvision.models.resnet101(weights="DEFAULT")
+        self.resnet.fc = nn.Identity()
+
         self.en = torchvision.models.efficientnet_v2_s(weights="IMAGENET1K_V1")
         self.en.classifier = torch.nn.Identity()
-        self.linear = torch.nn.Linear(2280, 1024, bias=True)
-        self.head = torch.nn.Linear(1024, 4, bias=True)
+        #self.linear = torch.nn.Linear(2280, 1024, bias=True)
+        #self.head = torch.nn.Linear(1024, 4, bias=True)
+
+        self.head = nn.Sequential(
+            nn.Linear(3328, 1024),
+            nn.ReLU(inplace=True),
+            nn.Dropout(p=0.2),
+            nn.Linear(1024, 4)
+        )
 
     def forward(self, x):
         bg = x[:, :3, :, :]
         fg = x[:, 3:, :, :]
 
-        bg = self.vit(bg)
+        bg = self.resnet(bg)
         fg = self.en(fg)
 
         x = torch.cat((bg,fg),1)
         
-        x = self.linear(x)
+        #x = self.linear(x)
+        x = self.head(x)
+        return x
+    
+class fusion_v5(nn.Module):
+    def __init__(self):
+        super(fusion_v5, self).__init__()
+        self.scene_encoder = ResnetEncoder()
+        self.obj_encoder = ENEncoder()
+        self.decoder = torch.nn.Sequential(
+            DecoderBlock(3328, 3328),
+            DecoderBlock(3328, 3328),
+            DecoderBlock(3328, 3328)
+        )
+        self.avg_pool = nn.AdaptiveAvgPool2d(output_size=(1, 1))
+        self.head = nn.Sequential(
+            nn.Linear(3328, 1024),
+            nn.ReLU(inplace=True),
+            nn.Dropout(p=0.2),
+            nn.Linear(1024, 4)
+        )
+        
+
+    def forward(self, x):
+        bg = x[:, :3, :, :]
+        fg = x[:, 3:, :, :]
+
+        bg = self.scene_encoder(bg)
+        fg = self.obj_encoder(fg)
+
+        x = torch.cat((bg,fg),1)
+        x = self.decoder(x)
+        x = self.avg_pool(x)
+        x = torch.flatten(x, start_dim=1)
         x = self.head(x)
         return x
     
@@ -396,13 +417,14 @@ class ENEncoder(nn.Module):
     def __init__(self):
         super().__init__()
         self.en = torchvision.models.efficientnet_v2_s(weights="IMAGENET1K_V1")
-        self.linear = nn.Linear(1280, 768)
+        
 
     def forward(self, x):
         x = self.en.features(x)
-        x = torch.flatten(x,start_dim=-2)
-        x = torch.permute(x, (0,2,1))
-        x = self.linear(x)
+        #x = self.en.avgpool(x)
+        # x = torch.flatten(x,start_dim=-2)
+        # x = torch.permute(x, (0,2,1))
+        #print("EN output:", x.mean(), x.std(), x.max())
         return x
     
 class ViTEncoder(nn.Module):
@@ -411,21 +433,64 @@ class ViTEncoder(nn.Module):
         self.vit = torchvision.models.vit_b_16(weights="IMAGENET1K_SWAG_E2E_V1")
 
     def forward(self, x):
+        if torch.isnan(x).any():
+            print("nan in VIT before process")
         x = self.vit._process_input(x)
+        if torch.isnan(x).any():
+            print("nan in VIT after process")
         n = x.shape[0]
 
         # Expand the class token to the full batch
         batch_class_token = self.vit.class_token.expand(n, -1, -1)
+        if torch.isnan(batch_class_token).any():
+            print("nan in VIT in batch class token")
         x = torch.cat([batch_class_token, x], dim=1)
 
         x = self.vit.encoder(x)
+        if torch.isnan(x).any():
+            print("nan in VIT after encoder")
+        
+        #print("VIT output:", x.mean(), x.std(), x.max())
         return x
+    
+class DecoderBlock(nn.Module):
+    def __init__(self, d, o):
+        super().__init__()
+        i = int(d/4)
+        self.conv1 = nn.Conv2d(d, i, kernel_size=(1, 1), stride=(1, 1), bias=False)
+        self.bn1 = nn.BatchNorm2d(i, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+        self.conv2 = nn.Conv2d(i, i, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False)
+        self.bn2 = nn.BatchNorm2d(i, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+        self.conv3 = nn.Conv2d(i, o, kernel_size=(1, 1), stride=(1, 1), bias=False)
+        self.bn3 = nn.BatchNorm2d(o, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+        self.relu = nn.ReLU(inplace=True)
+        if o < d:
+            self.upsample = nn.Sequential(
+                nn.Conv2d(d, o, kernel_size=(1, 1), stride=(1, 1), bias=False),
+                nn.BatchNorm2d(o, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+            )
+        else:
+            self.upsample = None
+
+    def forward(self, x):
+        identity = x
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = self.relu(x)
+        x = self.conv2(x)
+        x = self.bn2(x)
+        x = self.relu(x)
+        x = self.conv3(x)
+        x = self.bn3(x)
+        x = self.relu(x)
+        if self.upsample is not None:
+            identity = self.upsample(identity)
+        return self.relu(x + identity)
     
 class CrossAttention(nn.Module):
     def __init__(self):
         super().__init__()
         self.fg_norm = nn.LayerNorm(768)
-        self.bg_norm = nn.LayerNorm(768)
         self.fg_norm2 = nn.LayerNorm(768)
         self.mha = nn.MultiheadAttention(embed_dim=768, num_heads=8, batch_first=True)
         self.mlp = nn.Sequential(
@@ -435,33 +500,29 @@ class CrossAttention(nn.Module):
             nn.Linear(3072, 768)
         )
     def forward(self, fg, bg):
-        fg = self.fg_norm(fg)
-        bg = self.bg_norm(bg)
+        #fg = self.fg_norm(fg)
+        #bg = self.bg_norm(bg)
         
         attn_out, _ = self.mha(fg, bg, bg, need_weights=False)
+        #print(w.mean().item(), w.std().item())
 
         fg = fg + attn_out
-        fg = fg + self.mlp(self.fg_norm2(fg))
+        fg = self.fg_norm(fg)
+        fg = fg + self.mlp(fg)
 
-        return fg
+        return self.fg_norm2(fg)
     
 class Decoder(nn.Module):
     def __init__(self, num_queries, N):
         super().__init__()
         self.N = N
+        self.num_queries = 1
         self.query = nn.Embedding(num_queries, 768)
         self.self_attn = nn.MultiheadAttention(embed_dim=768, num_heads=8, batch_first=True)
         self.cross_attn = nn.MultiheadAttention(embed_dim=768, num_heads=8, batch_first=True)
-        self.norm1 = nn.LayerNorm(768)
         self.norm2 = nn.LayerNorm(768)
         self.norm3 = nn.LayerNorm(768)
         self.norm4 = nn.LayerNorm(768)
-        self.mlp1 = nn.Sequential(
-            nn.Linear(768, 1536),
-            nn.GELU(),
-            # dropout
-            nn.Linear(1536, 768)
-        )
         self.mlp2 = nn.Sequential(
             nn.Linear(768, 2048),
             nn.ReLU(),
@@ -470,15 +531,15 @@ class Decoder(nn.Module):
         )
 
     def forward(self, fg):
-        q = self.query.weight.unsqueeze(1).repeat(1, fg.shape[0], 1).transpose(0, 1) # (N, q, 4)
-        nq = self.norm1(q)
+        q = self.query.weight.unsqueeze(1).expand(-1, fg.shape[0] ,-1).transpose(0, 1) # (N, q, d)
 
-        s_attn_out, _ = self.self_attn(nq, nq, nq, need_weights=False)
+        s_attn_out, _ = self.self_attn(q, q, q, need_weights=False)
         q = q + s_attn_out
-        q = q + self.mlp1(self.norm2(q))
+        q = self.norm2(q)
         c_attn_out, _ = self.cross_attn(q, fg, fg, need_weights=False)
+        #print(w.mean().item(), w.std().item())
         q = q + c_attn_out
-        q = q + self.mlp2(self.norm3(q))
+        q = q + self.mlp2(q)
 
         return self.norm4(q)
 
@@ -490,7 +551,14 @@ class fusion_v3(nn.Module):
         self.en = ENEncoder()
         self.attn = CrossAttention()
         self.decoder = Decoder(num_queries=num_queries, N=batch_size)
-        self.head = nn.Linear(768, 4)
+        self.head = nn.Sequential(
+            nn.Linear(768, 256),
+            nn.ReLU(inplace=True),
+            nn.Linear(256, 256),
+            nn.ReLU(inplace=True),
+            nn.Linear(256, 4)
+        )
+        self.linear = nn.Linear(1280, 768)
 
     def forward(self, x):
 
@@ -502,20 +570,104 @@ class fusion_v3(nn.Module):
         fg = x[:, 3:, :, :] # (N, 3, H, W)
 
         bg = self.vit(bg) # (N, 577, D)
-        fg = self.en(fg) # (N, 144, D)
-        if torch.isnan(fg).any():
-            print("nan before self attn")
+        fg = self.en(fg) # (N, 144, 1280)
+        fg = self.linear(fg) # (N, 144, D)
+        #print("linear output:", fg.mean(), fg.std(), fg.max())
         fg = self.attn(fg, bg) # (N, 144, D)
-        if torch.isnan(fg).any():
-            print("nan after self attn")
+        #print("self attn:", fg.mean(), fg.std(), fg.max())
 
         query = self.decoder(fg) # (N, Q, D)
-        if torch.isnan(query).any():
-            print("nan after decoder")
+        #print("query attn:", query.mean(), query.std(), query.max())
         o = self.head(query) # (N, Q, 4)
-        if torch.isnan(o).any():
-            print("nan after head")
+        #print("query attn:", o.mean(), o.std(), o.max())
 
+        return o
+    
+class PositionalEncoding(nn.Module):
+
+    def __init__(self, d_model: int, dropout: float = 0.1, max_len: int = 5000):
+        super().__init__()
+        self.dropout = nn.Dropout(p=dropout)
+
+        position = torch.arange(max_len).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model))
+        pe = torch.zeros(max_len, 1, d_model)
+        pe[:, 0, 0::2] = torch.sin(position * div_term)
+        pe[:, 0, 1::2] = torch.cos(position * div_term)
+        self.register_buffer('pe', pe)
+
+    def forward(self, x):
+        """
+        Arguments:
+            x: Tensor, shape ``[seq_len, batch_size, embedding_dim]``
+        """
+        x = x + self.pe[:x.size(0)]
+        return self.dropout(x)
+
+class DinoEncoder(nn.Module):
+    def __init__(self):
+        super(DinoEncoder, self).__init__()
+        self.dino = dinov2_vitb14 = torch.hub.load('facebookresearch/dinov2', 'dinov2_vitb14')
+    
+    def forward(self, x):
+        with torch.cuda.amp.autocast(dtype=torch.float16):
+            y = self.dino(x, is_training=True)["x_norm_patchtokens"]
+        return y
+    
+class DenseDecoder(nn.Module):
+    def __init__(self, seq, dim):
+        super(DenseDecoder, self).__init__()
+        self.pre_flat = nn.Linear(dim, 256)
+        self.dropout = nn.Dropout(p=0.1)
+        self.relu = nn.ReLU()
+        self.linear1 = nn.Linear(256*seq, 512)
+        self.dropout1 = nn.Dropout(p=0.2)
+        self.relu1 = nn.ReLU()
+        self.linear2 = nn.Linear(512, 512)
+        self.dropout2 = nn.Dropout(p=0.2)
+        self.relu2 = nn.ReLU()
+        self.out = nn.Linear(512, 4)
+
+    def forward(self, x):
+        x = self.pre_flat(x)
+        x = self.relu(x)
+        x = self.dropout(x)
+        x = torch.flatten(x, 1)
+        x = self.linear1(x)
+        x = self.relu1(x)
+        x = self.dropout1(x)
+        x = self.linear2(x)
+        x = self.relu2(x)
+        x = self.dropout2(x)
+        #x = self.linear3(x)
+        return self.out(x)
+    
+class fusion_v4(nn.Module):
+    def __init__(self, num_queries, batch_size):
+        super(fusion_v4, self).__init__()
+        self.scene_encoder = DinoEncoder()
+        self.obj_encoder = DinoEncoder()
+        self.decoder = DenseDecoder(784, 768)
+        self.fusion1 = CrossAttention()
+        self.fusion2 = CrossAttention()
+
+    def forward(self, x):
+
+        # N = batch size
+        # D = embedding dim = 768     
+        # Q = number of queries  
+        
+        bg = x[:, :3, :, :] # (N, 3, H, W)
+        fg = x[:, 3:, :, :] # (N, 3, H, W)
+
+        bg = self.scene_encoder(bg) # (N, 577, D)
+        fg = self.obj_encoder(fg) # (N, 577, D)
+
+        #print("linear output:", fg.mean(), fg.std(), fg.max())
+        fg = self.fusion1(fg, bg) # (N, 144, D)
+        fg = self.fusion2(fg, bg) # (N, 144, D)
+        o = self.decoder(fg)
+        #o = self.head(q)
         return o
 
 
@@ -573,7 +725,7 @@ vit_transform = torchvision.transforms.Compose([
 ])
 
 efficient_net_transform = torchvision.transforms.Compose([
-    Resize((384,)),
+    Resize((392,)),
     #normalize_mask,
     torchvision.transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
 ])
@@ -733,6 +885,119 @@ class OPADataset_2(Dataset):
         
         return example.to(gpu), label.to(gpu), name
     
+class OPADataset_3(Dataset):
+    def __init__(self, label_dir, img_dir, obj_dir, transform=None, target_transform=None, obj_transform=None, classes=None):
+        with open(label_dir, "r") as f:
+            bbox_label = f.readlines()
+        self.pad_label = 55 # length of label (see how label is padded in __getitem__)
+        self.img_pad_size = 640
+        self.img_size = [384, 384] # target size of image
+        self.img_dir = img_dir
+        self.obj_dir = obj_dir
+        self.transform = transform
+        self.obj_transform = obj_transform
+        self.target_transform = target_transform
+        self.resize_ratio = self.img_size[0] / self.img_pad_size
+        new_label = []
+        if classes is not None:
+            for line in bbox_label:
+                list_line = line.split(",")
+                if list_line[2] in classes:
+                    new_label.append(line)
+            self.bbox_label = new_label
+        else:
+            self.bbox_label = bbox_label
+
+        
+
+
+    def __len__(self):
+        return len(self.bbox_label)
+
+    def __getitem__(self, idx):
+        label_line = self.bbox_label[idx].split(",")
+        img_id = label_line[1]
+        obj_id = label_line[0]
+        img_name = img_id + ".jpg"
+        obj_name = obj_id + ".jpg"
+        cat = label_line[2]
+        name = obj_id + "c" + img_id
+
+        img_path = os.path.join(self.img_dir, cat, img_name)
+        obj_path = os.path.join(self.obj_dir, cat, obj_name)       
+        image = decode_image(img_path).type(torch.float32)
+        obj = decode_image(obj_path).type(torch.float32)
+
+        label = label_line[3:]
+        label = [float(x) for x in label]
+        label = n_slice(label, 4)
+        for sublabel in label:
+            for i, element in enumerate(sublabel):
+                sublabel[i] = element * self.resize_ratio
+        while len(label) < self.pad_label:
+            label.append([float('inf')]*4)
+        label = torch.tensor(label).type(torch.float32)
+        # Dimension of (each) label is (n, 4) where we pad label to conain n = self.pad_label bboxes.
+        # Example: [[x1, y1, w1, h1],
+        #           [x2, y2, w2, h2],
+        #           ...
+        #           [xn, yn, wn, hn]]
+
+        if self.transform:
+            image = self.transform(image)
+            obj = self.obj_transform(obj)
+        if self.target_transform:
+            label = self.target_transform(label)
+        #print(image.shape)
+        #print(obj.shape)
+        example = torch.cat((image,obj),0)
+        
+        return example.to(gpu), label.to(gpu), name
+    
+class BGDataset(Dataset):
+    def __init__(self, label_dir, img_dir, obj_dir, transform=None, target_transform=None, obj_transform=None):
+        with open(label_dir, "r") as f:
+            self.bbox_label = f.readlines()
+        self.img_pad_size = 640
+        self.img_size = [320, 320] # target size of image
+        self.img_dir = img_dir
+        self.obj_dir = obj_dir
+        self.transform = transform
+        self.obj_transform = obj_transform
+        self.target_transform = target_transform
+        self.resize_ratio = self.img_size[0] / self.img_pad_size
+
+    def __len__(self):
+        return len(self.bbox_label)
+
+    def __getitem__(self, idx):
+        label_line = self.bbox_label[idx].split(",")
+        cat = label_line[1]
+        bg_id = label_line[0]
+        label = label_line[2:]
+        img_name = bg_id + ".jpg"
+
+        img_path = os.path.join(self.img_dir, cat, img_name)    
+        image = decode_image(img_path).type(torch.float32)
+
+        label = [int(x) for x in label]
+        label = n_slice(label, 2)
+        #label.sort(key=lambda x: x[0] + x[1])
+        for sublabel in label:
+            if sublabel[0] == -1:
+                break
+            for i, element in enumerate(sublabel):
+                sublabel[i] = element * self.resize_ratio
+        label = torch.tensor(label).type(torch.float32)
+        if self.transform:
+            image = self.transform(image)
+        if self.target_transform:
+            label = self.target_transform(label)
+        #print(image.shape)
+        #print(obj.shape)
+        
+        return image.to(gpu), label.to(gpu), img_name
+    
 class OPADistDataset(Dataset):
     def __init__(self, label_dir, img_dir, obj_dir, mask_dir, transform=None, target_transform=None):
         with open(label_dir, "r") as f:
@@ -873,11 +1138,13 @@ def matching_loss(pred, target, loss=None):
     """ pred: tensor (N, q, 4)
         target: tensor (N, q, 4)"""
     if loss is None:
-        loss = torchvision.ops.complete_box_iou_loss
+        loss = torch.nn.MSELoss(reduction="sum")
     N, q = pred.shape[:2]
     batch_loss = list()
+    """
     pred[:, :, [1, 3]] = pred[:, :, [3, 1]]
     target[:, :, [1, 3]] = target[:, :, [3, 1]]
+    """
     for k in range(N):
         current_loss = list()
         _pred = pred[k]
@@ -885,29 +1152,19 @@ def matching_loss(pred, target, loss=None):
         loss_matrix = torch.zeros((q, q))
         for i in range(q):
             for j in range(q):
-                if _tgt[j][0] == float("inf"):
+                if _tgt[j][0] == -1.0:
                     continue
                     #loss_matrix[i][j] = 0 
                 else:
                     loss_matrix[i][j] = loss(_pred[i], _tgt[j]).item()
-        try:
-            row_idx, col_idx = scipy.optimize.linear_sum_assignment(loss_matrix)
-        except:
-            print("matrix")
-            for l in loss_matrix:
-                print(l)
-            print("pred")
-            for p in _pred:
-                print(p)
-            for t in _tgt:
-                print(t)
-        non_zero_count = 0
+        row_idx, col_idx = scipy.optimize.linear_sum_assignment(loss_matrix)
+        #non_zero_count = 0
 
         opt_pred = []
         opt_tgt = []
         for i in range(q):
             row, col = row_idx[i], col_idx[i]
-            if _tgt[col][0] == float("inf"):
+            if _tgt[col][0] == -1.0:
                 continue
             else:
                 opt_pred.append(_pred[row])
@@ -915,7 +1172,7 @@ def matching_loss(pred, target, loss=None):
         opt_pred = torch.stack(opt_pred, dim=0)
         opt_tgt = torch.stack(opt_tgt, dim=0)
         
-        batch_loss.append(loss(opt_pred, opt_tgt, reduction="mean"))
+        batch_loss.append(loss(opt_pred, opt_tgt))
     return sum(batch_loss) / N
 
 
@@ -924,6 +1181,53 @@ def var_mse_min(pred, label):
 
     mse = torch.nn.MSELoss(reduction='sum')
     result = []
+    
+    for i in range(len(pred)):
+
+        min_loss_value = float("inf")
+        min_loss = None
+
+        subpred = pred[i]
+        sublabel = label[i]
+
+        for candidate in sublabel:
+
+            if candidate[0].item() == float("inf"):
+                break
+            
+            #print(f"Calculating loss between {subpred} and {candidate}")
+            loss = mse(subpred, candidate)
+            loss_value = loss.item()
+
+            if loss_value < min_loss_value:
+                min_loss_value = loss_value
+                min_loss = loss
+
+        #print(min_loss)
+        result.append(min_loss)
+    return sum(result) / len(pred)
+
+def var_ciou_min(pred, label):
+    """test ciou for each sublabel in label and return the minimum one
+    pred: (N, 4)
+    label: (N, q, 4)"""
+
+    pred[:, [1, 3]] = pred[:, [3, 1]]
+    label[:, :, [1, 3]] = label[:, :, [3, 1]]
+
+    loss = torchvision.ops.complete_box_iou_loss
+    N = len(pred)
+    batch_loss = list()
+    for i in range(N):
+        _pred = pred[i]
+        _label = label[i]
+        msk = torch.isfinite(_label).all(dim=1)
+        _label = _label[msk]
+        _pred = _pred.unsqueeze(0).expand(len(_label), -1)
+        losses = loss(_pred, _label)
+        batch_loss.append(losses.min())
+    return sum(batch_loss) / N
+
     
     for i in range(len(pred)):
 
@@ -989,12 +1293,14 @@ def train_loop(dataloader, model, loss_fn, optimizer, result_dict, t=None):
         start_forward = time.time()
         X = X.to(gpu)
         y = y.to(gpu)
+        if batch % 100 == 0:
+            print("batch num: ",batch, " out of ",batch_num)
         pred = model(X)
         #print("forward pass: ", time.time() - start_forward)
         start_loss = time.time()
         loss = loss_fn(pred, y)
         #print("calculate loss: ", time.time() - start_loss)
-        total_loss += loss.item()
+        
 
         # Backpropagation
         #loss.requires_grad = True
@@ -1003,12 +1309,14 @@ def train_loop(dataloader, model, loss_fn, optimizer, result_dict, t=None):
         #print()
         start_backward = time.time()
         loss.backward()
+        total_loss += loss.item()
         #print("backward: ", time.time() - start_backward)
         """
         for each_loss in loss:
             each_loss.backward(retain_graph=True)"""
         
         start_step = time.time()
+        #torch.nn.utils.clip_grad_norm_(model.parameters(), 0.1)
         optimizer.step()
         optimizer.zero_grad()
         #print("opt step: ", time.time() - start_step)

@@ -23,12 +23,16 @@ def get_dataset(dataloader, img_dir, label_dir, obj_dir, model, mask_dir):
             transform = vit_transform
             target_transform = None
         case "fusion_2":
-            transform = vit_transform_2
+            transform = vit_transform
             obj_transform = vit_transform_2 #efficient_net_transform
             target_transform = None
         case "fusion_3":
             transform = vit_transform
             obj_transform = vit_transform_2
+            target_transform = None
+        case "ResnetEncoder":
+            transform = vit_transform
+            obj_transform = None
             target_transform = None
 
     
@@ -49,6 +53,13 @@ def get_dataset(dataloader, img_dir, label_dir, obj_dir, model, mask_dir):
         case "OPA_2":
             return OPADataset_2(label_dir=label_dir, img_dir=img_dir, obj_dir=obj_dir,
                                   transform=transform, target_transform=target_transform, obj_transform=obj_transform)
+        case "OPA_3":
+            return OPADataset_3(label_dir=label_dir, img_dir=img_dir, obj_dir=obj_dir,
+                                  transform=transform, target_transform=target_transform, obj_transform=obj_transform,
+                                  classes=["keyboard"])
+        case "BGDataset":
+            return BGDataset(label_dir=label_dir, img_dir=img_dir, obj_dir=obj_dir,
+                                  transform=transform, target_transform=target_transform, obj_transform=obj_transform)
 
 def get_model(model, batch_size=8):
     match model:
@@ -63,9 +74,11 @@ def get_model(model, batch_size=8):
         case "b_vit":
             return base_vit_6_channels()
         case "fusion_2":
-            return fusion_v2()
+            return fusion_v5()
         case "fusion_3":
-            return fusion_v3(55, batch_size)
+            return fusion_v4(55, batch_size)
+        case "ResnetEncoder":
+            return ResnetEncoder()
 def get_loss(loss):
     match loss:
         case "mse":
@@ -77,20 +90,23 @@ def get_loss(loss):
         case "dice":
             return dice_loss
         case "matching":
-            return matching_loss
+            return var_mse_min
+        case "var_ciou_min":
+            return var_ciou_min
         
 def get_optim(optim, model, lr):
     match optim:
         case "adam":
-            return torch.optim.Adam(model.parameters(), lr=lr)
+            return torch.optim.Adam(model.parameters(), lr=lr
+            )
 
 
 def main(dataloader, img_dir, label_dir, mask_dir, model, loss,
          lr, optim, epoch, test_label_dir=None,
          batch_size="16", obj_dir=None):
-    dataloaders = ["one_channel", "two_channel", "OPA", "OPA_Dist", "OPA_2"]
-    models = ["double_resnet50", "lraspp", "unet", "ynet", "b_vit", "fusion_2", "fusion_3"]
-    losses = ["mse", "var_mse_min", "kldiv", "dice", "matching"]
+    dataloaders = ["one_channel", "two_channel", "OPA", "OPA_Dist", "OPA_2", "OPA_3", "BGDataset"]
+    models = ["double_resnet50", "lraspp", "unet", "ynet", "b_vit", "fusion_2", "fusion_3", "ResnetEncoder"]
+    losses = ["mse", "var_mse_min", "kldiv", "dice", "matching", "var_ciou_min"]
     optims = ["adam"]
     #torch.multiprocessing.set_start_method('spawn')
     #torch.autograd.set_detect_anomaly(True)
@@ -132,7 +148,7 @@ def main(dataloader, img_dir, label_dir, mask_dir, model, loss,
         train_dataset, test_dataset = torch.utils.data.random_split(dataset, [0.8, 0.2])
 
     model = get_model(model, batch_size)
-    #model.load_state_dict(torch.load("checkpoint.pt", weights_only=True))
+    #model.load_state_dict(torch.load("saved_model/fusion_v5.pt", weights_only=True))
     model.to(gpu)
     print("parameters:", sum(p.numel() for p in model.parameters())) 
     #print("trainable", pytorch_total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)) 
@@ -152,7 +168,7 @@ def main(dataloader, img_dir, label_dir, mask_dir, model, loss,
         print("-------------------------------\n")
 
         # save intermediate model every 10 epochs
-        if t != 1 and t % 3 == 0:
+        if True:
             i_modelname = str(t + 1) + "weight.pt"
             torch.save(model.state_dict(), i_modelname)
             print("Model weight saved to ", i_modelname)

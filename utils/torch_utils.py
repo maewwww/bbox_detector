@@ -39,6 +39,11 @@ class SigmoidWrapper(nn.Module):
         out["out"] = torch.sigmoid(out["out"])
         return out
 
+def get_cat(img, root):
+    for cat in os.listdir(root):
+        if img+".jpg" in os.listdir(os.path.join(root, cat)):
+            return cat
+
 def OneOutLRASPP():
     model = lraspp_mobilenet_v3_large(num_classes=1)
 
@@ -395,7 +400,7 @@ class fusion_v5(nn.Module):
             nn.Linear(3328, 1024),
             nn.ReLU(inplace=True),
             nn.Dropout(p=0.2),
-            nn.Linear(1024, 4)
+            nn.Linear(1024, 4),
         )
         
 
@@ -732,7 +737,7 @@ efficient_net_transform = torchvision.transforms.Compose([
 
 vit_transform_2 = torchvision.transforms.Compose([
     square_pad,
-    Resize([384,384], interpolation=torchvision.transforms.InterpolationMode.BILINEAR),
+    Resize([128,128], interpolation=torchvision.transforms.InterpolationMode.BILINEAR),
     #normalize_mask,
     torchvision.transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
 ])

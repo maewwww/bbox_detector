@@ -737,7 +737,7 @@ efficient_net_transform = torchvision.transforms.Compose([
 
 vit_transform_2 = torchvision.transforms.Compose([
     square_pad,
-    Resize([128,128], interpolation=torchvision.transforms.InterpolationMode.BILINEAR),
+    Resize([256,256], interpolation=torchvision.transforms.InterpolationMode.BILINEAR),
     #normalize_mask,
     torchvision.transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
 ])
